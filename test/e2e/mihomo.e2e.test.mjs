@@ -24,7 +24,11 @@ async function outlet(name) {
   })
   server.on('connect', (_req, socket) => {
     socket.write('HTTP/1.1 200 Connection Established\r\n\r\n')
-    socket.once('data', () => {
+    socket.once('data', (data) => {
+      if (data.toString().includes('/hold')) {
+        socket.write('HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n1\r\nX\r\n')
+        return
+      }
       requests++
       socket.end(`HTTP/1.1 200 OK\r\nContent-Length: ${name.length}\r\nConnection: close\r\n\r\n${name}`)
     })
@@ -76,7 +80,27 @@ test('official Mihomo: independent exits, reload, fail-closed removal, stable bi
   assert.equal(await through(first[idA]), 'A')
   assert.equal(await through(first[idB]), 'B')
   assert.deepEqual(await Promise.all([through(first[idA]), through(first[idB]), through(first[idA])]), ['A', 'B', 'A'])
+  const agentA = createProxyAgent(localProxyUrl(first[idA]))
+  const agentB = createProxyAgent(localProxyUrl(first[idB]))
+  const streamA = await nodeFetch('http://192.0.2.1/hold', { agent: agentA, signal: AbortSignal.timeout(15000) })
+  const streamB = await nodeFetch('http://192.0.2.1/hold', { agent: agentB, signal: AbortSignal.timeout(15000) })
+  let closedA = false,
+    closedB = false
+  streamA.body.on('error', () => {
+    closedA = true
+  })
+  streamB.body.on('error', () => {
+    closedB = true
+  })
+  streamA.body.resume()
+  streamB.body.resume()
   await manager.perform({ action: 'node_disable', id: idA })
+  for (let i = 0; i < 30 && !closedA; i++) await new Promise((resolve) => setTimeout(resolve, 50))
+  assert.equal(closedA, true, 'disabled node must close existing streams')
+  assert.equal(closedB, false, 'unrelated node stream must survive')
+  agentA.destroy()
+  agentB.destroy()
+
   await assert.rejects(through(first[idA]))
   assert.equal(await through(first[idB]), 'B')
   await manager.perform({ action: 'node_enable', id: idA })

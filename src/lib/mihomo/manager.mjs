@@ -283,6 +283,7 @@ export class MihomoManager {
           if (action === 'source_refresh' || action === 'source_update') {
             if (source.kind !== 'subscription') throw fault('not_subscription', '动态代理不使用订阅刷新')
             const url = action === 'source_update' ? subscriptionUrl(body.url) : source.url
+            if (action === 'source_update') source.label = label(body.label, source.label)
             if (next.sources.some((s) => s.id !== source.id && s.url === url))
               throw fault('duplicate_source', '订阅已存在')
             source.nodes = await this.download(url)

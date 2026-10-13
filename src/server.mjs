@@ -4,10 +4,10 @@
  * (slot SOCKS5 + OAuth owner + SSE terminal validation).
  * The gateway converts protocols, schedules the account pool with bounded
  * failover, and never talks to Anthropic on the inference path. After a live
- * OAuth import { MihomoManager } from './lib/mihomo/manager.mjs'
-import it may spawn official Claude Code once (slot SOCKS5) to seed
+ * OAuth import it may spawn official Claude Code once (slot SOCKS5) to seed
  * ~/.claude.json and complete a plan turn.
  */
+import { MihomoManager } from './lib/mihomo/manager.mjs'
 import http from 'node:http'
 import fs from 'node:fs'
 import path from 'node:path'
