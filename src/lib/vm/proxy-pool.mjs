@@ -11,6 +11,7 @@
  */
 import { EventEmitter } from 'node:events'
 import net from 'node:net'
+import { managedNodeId, checkExit } from '../mihomo/manager.mjs'
 import crypto from 'node:crypto'
 import { resolveStoreDb } from '../db/database.mjs'
 import { ProxiesRepo } from '../db/repos/proxies-repo.mjs'
@@ -305,6 +306,7 @@ export class ProxyPool extends EventEmitter {
     repairEgress,
     geoLookup,
     geoV6Lookup,
+    canUseManagedProxy,
   } = {}) {
     super()
     // One listener per open panel stream.
@@ -314,6 +316,7 @@ export class ProxyPool extends EventEmitter {
     this.onDisableVm = onDisableVm // (vmId, reason, proxyId) => void
     this.onDisconnectVm = onDisconnectVm // (vmId, reason, proxyId) => void — experimental tear-down
     this.onEnableVm = onEnableVm // (vmId, reason, proxyId) => void
+    this.canUseManagedProxy = canUseManagedProxy || (() => true)
     this.egressCheck = egressCheck
     this.repairEgress = repairEgress
     // Injectable so geo detection is testable without leaving the machine.
@@ -449,6 +452,7 @@ export class ProxyPool extends EventEmitter {
     const blocked = proxyBlockedReason(p, this.state.config.ipv6_enabled)
     return {
       id: p.id,
+      managed: !!managedNodeId(p.id),
       host: p.host,
       port: p.port,
       label: p.label || null,
@@ -473,6 +477,34 @@ export class ProxyPool extends EventEmitter {
       geo: proxyGeoOf(p),
       geo_v6: proxyGeoV6Of(p),
     }
+  }
+
+  upsertManaged(record) {
+    let p = this.state.proxies.find((p) => p.id === record.id)
+    if (!p) {
+      p = {
+        ...record,
+        scheme: 'socks5',
+        status: 'unknown',
+        owner_user_id: null,
+        bound_vm_id: null,
+        bound_vm_ids: [],
+        created_at: new Date().toISOString(),
+      }
+      this.state.proxies.push(p)
+    }
+    const wasEnabled = p.enabled
+    Object.assign(p, record)
+    if (!p.enabled) {
+      p.status = 'dead'
+      this._cascadeDisableVm(p, 'mihomo_unavailable')
+    } else if (!wasEnabled || p.status === 'dead') {
+      p.status = 'unknown'
+      p.consecutive_failures = 0
+      p.last_error = null
+    }
+    this.save()
+    return this.publicProxy(p)
   }
 
   ensureLocal() {
@@ -590,10 +622,23 @@ export class ProxyPool extends EventEmitter {
    */
   ensureBoundToVm(vmId, preferredId = null) {
     if (!vmId) return null
+    if (
+      this.state.proxies.some(
+        (p) =>
+          managedNodeId(p.id) &&
+          proxyHasVm(p, vmId) &&
+          (!p.enabled || p.status === 'dead' || p.status === 'fail' || !this.canUseManagedProxy(vmId)),
+      )
+    )
+      return null
     if (this.state.proxies.some((p) => proxyHasVm(p, vmId) && proxyBlockedReason(p, this.state.config.ipv6_enabled)))
       return null
     const existing = this.getProxyForVm(vmId)
     if (existing) return existing
+    if (managedNodeId(preferredId)) {
+      const bound = this.bind(preferredId, vmId)
+      return bound.ok ? this.getProxyForVm(vmId) : null
+    }
     if (preferredId) {
       const preferred = this.state.proxies.find((p) => p.id === preferredId)
       if (proxyBlockedReason(preferred, this.state.config.ipv6_enabled)) return null
@@ -606,6 +651,15 @@ export class ProxyPool extends EventEmitter {
   /** Allocate one healthy proxy with remaining capacity and bind to vmId */
   allocateForVm(vmId, { ownerUserId = null, role = 'admin' } = {}) {
     if (!vmId) return null
+    if (
+      this.state.proxies.some(
+        (p) =>
+          managedNodeId(p.id) &&
+          proxyHasVm(p, vmId) &&
+          (!p.enabled || p.status === 'dead' || p.status === 'fail' || !this.canUseManagedProxy(vmId)),
+      )
+    )
+      return null
     if (this.state.proxies.some((p) => proxyHasVm(p, vmId) && proxyBlockedReason(p, this.state.config.ipv6_enabled)))
       return null
     const existing = this.state.proxies.find(
@@ -617,6 +671,7 @@ export class ProxyPool extends EventEmitter {
     const owner = normalizeOwnerId(ownerUserId)
     const candidates = this.state.proxies.filter((p) => {
       if (!p.enabled || p.status === 'dead' || p.status === 'fail') return false
+      if (managedNodeId(p.id) && !this.canUseManagedProxy(vmId)) return false
       if (proxyBlockedReason(p, this.state.config.ipv6_enabled)) return false
       if (boundVmIdsOf(p).length >= limit) return false
       return proxyOwnerId(p) === owner
@@ -633,6 +688,8 @@ export class ProxyPool extends EventEmitter {
   }
 
   bind(proxyId, vmId) {
+    if (managedNodeId(proxyId) && !this.canUseManagedProxy(vmId))
+      return { ok: false, error: 'mihomo_requires_local_slot' }
     const p = this.state.proxies.find((x) => x.id === proxyId)
     if (!p) return { ok: false, error: 'proxy_not_found' }
     if (!p.enabled || p.status === 'dead') return { ok: false, error: 'proxy_disabled' }
@@ -689,6 +746,7 @@ export class ProxyPool extends EventEmitter {
   }
 
   setEnabled(proxyId, enabled) {
+    if (managedNodeId(proxyId)) return { ok: false, error: 'use_mihomo_management' }
     const p = this.state.proxies.find((x) => x.id === proxyId)
     if (!p) return { ok: false, error: 'proxy_not_found' }
     p.enabled = !!enabled
@@ -704,7 +762,8 @@ export class ProxyPool extends EventEmitter {
     return { ok: true, proxy: this.publicProxy(p) }
   }
 
-  remove(proxyId) {
+  remove(proxyId, { managed = false } = {}) {
+    if (managedNodeId(proxyId) && !managed) return { ok: false, error: 'use_mihomo_management' }
     const idx = this.state.proxies.findIndex((x) => x.id === proxyId)
     if (idx < 0) return { ok: false, error: 'proxy_not_found' }
     const [p] = this.state.proxies.splice(idx, 1)
@@ -727,6 +786,7 @@ export class ProxyPool extends EventEmitter {
     if (!p) return { ok: false, error: 'proxy_not_found' }
     const has = (k) => Object.prototype.hasOwnProperty.call(patch, k)
     const connection = ['host', 'port', 'username', 'password'].some(has)
+    if (connection && managedNodeId(proxyId)) return { ok: false, error: 'mihomo_endpoint_readonly' }
     if (!connection && !has('label') && !has('domain_forward')) {
       return { ok: false, error: 'no_editable_fields' }
     }
@@ -914,7 +974,13 @@ export class ProxyPool extends EventEmitter {
       // Host default route. A down kin-egress is not "no proxy".
       return { ok: true, scope: 'local', mode: 'direct', latency_ms: 0 }
     }
-    const socks = await this._probeSocks(proxy)
+    const socks = managedNodeId(proxy.id)
+      ? await checkExit(socksProxyUrl(proxy, 'socks5h')).then((r) => ({
+          ok: r.success,
+          latency_ms: r.latency_ms,
+          error: r.success ? null : 'mihomo_exit_unreachable',
+        }))
+      : await this._probeSocks(proxy)
     if (socks.scope === 'policy') return socks
     if (!socks.ok) return { ...socks, scope: 'socks' }
     if (typeof this.egressCheck !== 'function') return { ...socks, scope: 'socks' }

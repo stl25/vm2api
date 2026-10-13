@@ -4,6 +4,7 @@ import { VIEW_TITLES } from '@/config/nav'
 import type { Vm, VmProxySnap } from '@/types/panel-vm'
 import { Plus, Settings2 } from 'lucide-react'
 import { toast } from 'sonner'
+import { useAuthStore } from '@/stores/auth-store'
 import { api } from '@/lib/api'
 import { cn } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
@@ -19,6 +20,7 @@ import { PageHeader } from '@/components/page-header'
 import { SectionSkeleton } from '@/components/page-skeletons'
 import { QueryGate } from '@/components/query-gate'
 import { dashboardQueryOptions } from '@/features/overview/queries'
+import { MihomoPanel } from './mihomo-panel'
 import { ProxyBulkActions } from './proxy-bulk-actions'
 import { ProxyEditDialog } from './proxy-edit-dialog'
 import { createProxyHover } from './proxy-hover'
@@ -91,6 +93,8 @@ function firstOf(set: Set<string>): string {
 }
 
 export function ProxiesPage() {
+  const admin = useAuthStore((s) => s.me?.role === 'admin')
+  const [mihomoOpen, setMihomoOpen] = useState(false)
   const px = useQuery(proxiesQueryOptions())
   const dash = useQuery(dashboardQueryOptions())
   const refresh = useRefreshProxies()
@@ -340,6 +344,16 @@ export function ProxiesPage() {
       title={VIEW_TITLES.proxies}
       extra={
         <div className='flex flex-wrap items-center gap-2'>
+          {admin && (
+            <Button
+              variant='outline'
+              size='sm'
+              aria-expanded={mihomoOpen}
+              onClick={() => setMihomoOpen(!mihomoOpen)}
+            >
+              Mihomo 订阅
+            </Button>
+          )}
           <ProxyBulkActions empty={!list.length} />
           <Button
             variant='outline'
@@ -385,6 +399,7 @@ export function ProxiesPage() {
         }
       >
         <div className='space-y-4'>
+          {admin && mihomoOpen && <MihomoPanel />}
           <ProxyOverview
             proxies={sorted}
             vms={vms}

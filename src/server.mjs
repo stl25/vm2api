@@ -4,7 +4,8 @@
  * (slot SOCKS5 + OAuth owner + SSE terminal validation).
  * The gateway converts protocols, schedules the account pool with bounded
  * failover, and never talks to Anthropic on the inference path. After a live
- * OAuth import it may spawn official Claude Code once (slot SOCKS5) to seed
+ * OAuth import { MihomoManager } from './lib/mihomo/manager.mjs'
+import it may spawn official Claude Code once (slot SOCKS5) to seed
  * ~/.claude.json and complete a plan turn.
  */
 import http from 'node:http'
@@ -331,6 +332,7 @@ requestLog.startCleanupScheduler()
 
 proxyPool = new ProxyPool({
   dataDir,
+  canUseManagedProxy: (vmId) => !getVm(cfg.paths.project, vmId)?.node_id,
   onDisableVm: (vmId, reason, proxyId) => {
     setVmSchedulable(cfg.paths.project, vmId, false, `${reason}|proxy=${proxyId}`)
   },
@@ -346,6 +348,8 @@ proxyPool = new ProxyPool({
   egressCheck: (proxy) => proxyEgressReady(proxy, cfg.paths.project),
   repairEgress: (proxy) => ensureProxyEgress(cfg.paths.project, proxy),
 })
+const mihomo = new MihomoManager({ dataDir, proxyPool })
+await mihomo.restore()
 proxyPool.startScheduler()
 
 // 首次安装的出口池是空的，槽没有可绑出口就起不来。本机出口永远成立，先补上。
@@ -845,6 +849,7 @@ cliNodeGuard = createCliNodeGuard({
 })
 
 const handlePanel = createPanelHandler({
+  mihomo,
   json,
   writeSSEHeaders,
   readBody,
@@ -1126,10 +1131,11 @@ process.on('unhandledRejection', (e) => console.error('[unhandled]', e))
 
 // Graceful shutdown: stop schedulers/watchers, close the DB (WAL checkpoint).
 let _shuttingDown = false
-function shutdown(signal) {
+async function shutdown(signal) {
   if (_shuttingDown) return
   _shuttingDown = true
   console.log(`[shutdown] ${signal} — closing`)
+  await mihomo.close()
   try {
     backupService.stopScheduler()
   } catch {}

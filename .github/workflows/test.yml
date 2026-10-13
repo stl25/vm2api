@@ -42,6 +42,10 @@ jobs:
           npm run fetch:payload
           npm run build:egress
       - run: npm run test:unit
+      - name: Mihomo real-kernel isolation and restart regression
+        env:
+          KIN_MIHOMO_INSTALL_SMOKE: '1'
+        run: node --test test/e2e/mihomo.e2e.test.mjs
       - name: ARM64 host preparation and rollback tests
         run: python3 -m unittest discover -s test/deploy -v
 
@@ -139,3 +143,24 @@ jobs:
           pnpm format:check
           pnpm test
           pnpm build
+
+  mihomo-package:
+    if: github.repository == 'stl25/vm2api' && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/codex/mihomo-proxy-management'
+    needs: [unit, web, worker, kernel, arm64]
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build deployment image from the verified commit
+        run: |
+          docker build --label org.opencontainers.image.revision=${{ github.sha }} -t vm2api-mihomo:${{ github.sha }} .
+          docker save vm2api-mihomo:${{ github.sha }} | gzip -1 > vm2api-mihomo.tar.gz
+          sha256sum vm2api-mihomo.tar.gz > vm2api-mihomo.tar.gz.sha256
+      - uses: actions/upload-artifact@v7
+        with:
+          name: vm2api-mihomo-${{ github.sha }}
+          path: |
+            vm2api-mihomo.tar.gz
+            vm2api-mihomo.tar.gz.sha256
+          retention-days: 7
+          compression-level: 0

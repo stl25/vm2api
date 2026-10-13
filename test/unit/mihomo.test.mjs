@@ -1,0 +1,224 @@
+import test from 'node:test'
+import assert from 'node:assert/strict'
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
+import { parseSubscription, parseDynamic, collectNodes, kernelConfig, fault } from '../../src/lib/mihomo/config.mjs'
+import { MihomoManager, managedProxyId, checkExit } from '../../src/lib/mihomo/manager.mjs'
+import { ProxyPool } from '../../src/lib/vm/proxy-pool.mjs'
+import { authorizePanelRoute } from '../../src/lib/admin/panel-acl.mjs'
+
+const subscription = (server = 'one.example', name = '节点一') =>
+  JSON.stringify({
+    proxies: [{ name, type: 'socks5', server, port: 1080, username: 'user', password: 'secret-node' }],
+    listeners: [{ port: 80 }],
+    rules: ['MATCH,DIRECT'],
+  })
+function fixture(t, options = {}) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'vm2api-mihomo-'))
+  const runtime = {
+    installed: true,
+    running: false,
+    configs: [],
+    rejected: [],
+    async start(c) {
+      this.running = true
+      this.configs.push(c)
+    },
+    async stop() {
+      this.running = false
+    },
+    async apply(c, reject = []) {
+      if (this.fail) throw fault('kernel_failed', 'failed', 502)
+      this.configs.push(c)
+      this.rejected = reject
+    },
+    async install() {
+      this.installed = true
+    },
+  }
+  const pool = new ProxyPool({ dataDir: dir, canUseManagedProxy: (id) => id !== 'remote' })
+  const fetches = []
+  const manager = new MihomoManager({
+    dataDir: dir,
+    proxyPool: pool,
+    runtime,
+    fetchImpl: async (url, opts) => {
+      fetches.push({ url, opts })
+      return { ok: true, text: async () => subscription() }
+    },
+    ...options,
+  })
+  t.after(async () => {
+    await manager.close()
+    pool.stopScheduler()
+    pool.db.close()
+    fs.rmSync(dir, { recursive: true, force: true })
+  })
+  return { manager, pool, runtime, dir, fetches }
+}
+const add = (manager, url = 'https://source.example/?token=secret-url') =>
+  manager.perform({ action: 'source_add', url })
+
+test('only outbound nodes are imported; identity excludes name but includes credentials', () => {
+  const a = parseSubscription(subscription())[0]
+  const b = parseSubscription(subscription('one.example', '改名'))[0]
+  assert.equal(a.id, b.id)
+  assert.equal(a.config.name, undefined)
+  assert.throws(() => parseSubscription('proxies: []'))
+  assert.throws(() => parseSubscription('proxies: [{type: direct, name: bypass}]'))
+  assert.throws(() => parseSubscription('proxies: [{type: socks5, server: abc, port: 1080, dialer-proxy: DIRECT}]'))
+  assert.throws(() => parseSubscription('proxies: [{type: socks5, server: abc, port: 1080, private-key: /secret}]'))
+  assert.throws(() => parseSubscription('proxies: [{type: socks5, server: abc, port: 0}]'))
+  assert.equal(parseDynamic('socks5://user:pass@127.0.0.1:1234#节点\nhttps://user:pass@host:443')[1].config.tls, true)
+  assert.throws(() => parseDynamic('file:///secret'))
+})
+
+test('Mihomo API is admin-only for reads and writes', () => {
+  for (const method of ['GET', 'POST', 'PUT', 'DELETE']) {
+    assert.equal(authorizePanelRoute(method, '/api/panel/mihomo', 'admin').ok, true)
+    for (const role of ['user', 'super']) assert.equal(authorizePanelRoute(method, '/api/panel/mihomo', role).ok, false)
+  }
+})
+
+test('source secrets never appear in status; downloaded top-level configuration is ignored', async (t) => {
+  const { manager } = fixture(t)
+  await add(manager)
+  assert.doesNotMatch(JSON.stringify(manager.status()), /secret-url|secret-node|one\.example/)
+  const config = kernelConfig(manager.state)
+  assert.deepEqual(config.rules, ['MATCH,REJECT'])
+  assert.equal(config.listeners.length, 0)
+})
+
+test('shared nodes survive source removal; deleting last source rejects fixed listener', async (t) => {
+  const { manager, runtime } = fixture(t)
+  await add(manager)
+  await add(manager, 'https://two.example')
+  const id = manager.status().nodes[0].id
+  assert.equal(manager.status().nodes.length, 1)
+  await manager.perform({ action: 'start' })
+  await manager.perform({ action: 'node_export', ids: [id] })
+  await manager.perform({ action: 'source_remove', id: manager.status().sources[0].id })
+  assert.equal(manager.status().nodes.length, 1)
+  await manager.perform({ action: 'source_remove', id: manager.status().sources[0].id })
+  assert.equal(manager.status().nodes.length, 0)
+  assert.equal(runtime.configs.at(-1).listeners.find((l) => l.name === id).proxy, 'REJECT')
+  assert.ok(runtime.rejected.includes(id))
+})
+
+test('failed refresh/apply preserve previous cached sources and settings', async (t) => {
+  const { manager, runtime } = fixture(t)
+  await add(manager)
+  const before = fs.readFileSync(manager.file, 'utf8')
+  manager.fetch = async () => {
+    throw new Error('secret-url')
+  }
+  await assert.rejects(manager.perform({ action: 'source_refresh', id: manager.state.sources[0].id }), /原节点保留/)
+  assert.equal(fs.readFileSync(manager.file, 'utf8'), before)
+  runtime.fail = true
+  await assert.rejects(manager.perform({ action: 'source_disable', id: manager.state.sources[0].id }))
+  assert.equal(fs.readFileSync(manager.file, 'utf8'), before)
+  assert.equal(manager.state.sources[0].enabled, true)
+})
+
+test('proxy-only download never falls back; direct ignores running proxy; auto falls back on bad YAML', async (t) => {
+  const { manager, fetches } = fixture(t)
+  await manager.perform({ action: 'download_mode', mode: 'proxy' })
+  await assert.rejects(add(manager), /不会回退直连/)
+  assert.equal(fetches.length, 0)
+  await manager.perform({ action: 'start' })
+  manager.fetch = async (_url, opts) => {
+    fetches.push(opts)
+    return { ok: true, text: async () => (opts.agent ? '<html>error</html>' : subscription()) }
+  }
+  await assert.rejects(add(manager))
+  assert.equal(fetches.length, 1)
+  await manager.perform({ action: 'download_mode', mode: 'auto' })
+  await add(manager)
+  assert.equal(fetches.length, 3)
+  assert.ok(fetches[1].agent)
+  assert.equal(fetches[2].agent, undefined)
+  await manager.perform({ action: 'download_mode', mode: 'direct' })
+  await manager.perform({ action: 'source_refresh', id: manager.state.sources[0].id })
+  assert.equal(fetches.at(-1).agent, undefined)
+})
+
+test('fixed port credentials persist; repeat export reuses proxy; unavailable bound slot cannot auto-switch', async (t) => {
+  const { manager, pool, runtime, dir } = fixture(t)
+  pool.ensureLocal()
+  await add(manager)
+  await manager.perform({ action: 'start' })
+  const id = manager.status().nodes[0].id
+  await manager.perform({ action: 'node_export', ids: [id] })
+  const binding = structuredClone(manager.state.bindings[id])
+  await manager.perform({ action: 'node_export', ids: [id] })
+  assert.deepEqual(manager.state.bindings[id], binding)
+  const proxyId = managedProxyId(id)
+  assert.equal(pool.snapshot().proxies.filter((p) => p.id === proxyId).length, 1)
+  assert.equal(pool.bind(proxyId, 'slot').ok, true)
+  assert.equal(pool.bind(proxyId, 'remote').ok, false)
+  assert.equal(pool.update(proxyId, { port: 1 }).ok, false)
+  assert.equal(pool.remove(proxyId).ok, false)
+  await assert.rejects(manager.perform({ action: 'node_unexport', id }), /解除/)
+  await manager.perform({ action: 'node_disable', id })
+  assert.equal(pool.allocateForVm('slot'), null)
+  assert.equal(pool.ensureBoundToVm('slot', proxyId), null)
+  assert.equal(runtime.configs.at(-1).listeners.find((l) => l.name === id).proxy, 'REJECT')
+  await manager.perform({ action: 'node_enable', id })
+  assert.equal(pool.getProxyForVm('slot').id, proxyId)
+  const restored = new MihomoManager({ dataDir: dir, proxyPool: pool, runtime })
+  assert.deepEqual(restored.state.bindings[id], binding)
+  await restored.restore()
+  assert.equal(runtime.running, true)
+})
+
+test('removing and re-exporting a proxy reserves the old node port; endpoints cannot be edited', async (t) => {
+  const { manager, pool } = fixture(t)
+  await add(manager)
+  await manager.perform({ action: 'start' })
+  const id = manager.status().nodes[0].id
+  await manager.perform({ action: 'node_export', id })
+  const port = manager.state.bindings[id].port
+  await manager.perform({ action: 'node_unexport', id })
+  assert.equal(pool.snapshot().proxies.length, 0)
+  assert.equal(manager.state.bindings[id].port, port)
+  await manager.perform({ action: 'node_export', id })
+  assert.equal(manager.state.bindings[id].port, port)
+})
+
+test('isolated diagnostics do not mutate node state or persistent configuration', async (t) => {
+  const { manager } = fixture(t, { probeImpl: async () => ({ success: false, latency_ms: 0 }) })
+  await add(manager)
+  const id = manager.status().nodes[0].id
+  await manager.perform({ action: 'node_disable', id })
+  const before = fs.readFileSync(manager.file, 'utf8')
+  await manager.test(id, true)
+  assert.equal(fs.readFileSync(manager.file, 'utf8'), before)
+  assert.equal(manager.status().nodes[0].enabled, false)
+  assert.equal(manager.status().nodes[0].check.success, false)
+})
+
+test('concurrent management is rejected without committing an in-flight download twice', async (t) => {
+  let release
+  const { manager } = fixture(t, {
+    fetchImpl: () =>
+      new Promise((r) => {
+        release = () => r({ ok: true, text: async () => subscription() })
+      }),
+  })
+  const first = add(manager)
+  await assert.rejects(manager.perform({ action: 'download_mode', mode: 'direct' }), /正在处理/)
+  release()
+  await first
+  assert.equal(manager.state.sources.length, 1)
+})
+
+test('quality result is based on actual target responses, not TCP greeting', async () => {
+  const result = await checkExit('socks5h://127.0.0.1:9', true, {
+    fetchImpl: async (url) => ({ status: url.includes('gstatic') ? 503 : 200 }),
+    geoImpl: async () => ({ ok: false }),
+  })
+  assert.equal(result.success, false)
+  assert.equal(result.quality.passed, 2)
+  assert.equal(result.geo_ok, false)
+})
