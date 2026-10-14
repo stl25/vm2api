@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import {
+  mihomoInstallFeedback,
   applyMihomoBatches,
   runMihomoChecks,
   filterMihomoNodes,
@@ -103,5 +104,41 @@ describe('Mihomo batch operations', () => {
       )
     ).rejects.toThrow('已应用 100 个；本批 100 个未确认成功；后续 50 个未处理')
     expect(calls).toBe(2)
+  })
+})
+
+describe('Mihomo installation feedback', () => {
+  it('shows actual downloaded bytes and determinate or indeterminate progress', () => {
+    const progress = {
+      stage: 'downloading' as const,
+      version: 'v1.20.1',
+      downloaded_bytes: 5 * 1024 * 1024,
+      total_bytes: 20 * 1024 * 1024,
+    }
+    expect(mihomoInstallFeedback(progress)).toEqual({
+      label: '正在下载内核',
+      percent: 25,
+      bytes: '5.0 MB / 20.0 MB',
+      active: true,
+    })
+    expect(
+      mihomoInstallFeedback({ ...progress, total_bytes: null }).percent
+    ).toBeNull()
+  })
+  it('distinguishes startup from successful completion and failure', () => {
+    const progress = {
+      version: 'latest',
+      downloaded_bytes: 0,
+      total_bytes: null,
+    }
+    expect(
+      mihomoInstallFeedback({ ...progress, stage: 'starting' }).label
+    ).toContain('等待监听就绪')
+    expect(
+      mihomoInstallFeedback({ ...progress, stage: 'complete' })
+    ).toMatchObject({ label: '安装完成，内核已启动', active: false })
+    expect(mihomoInstallFeedback({ ...progress, stage: 'failed' }).active).toBe(
+      false
+    )
   })
 })

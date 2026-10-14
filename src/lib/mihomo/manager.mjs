@@ -16,7 +16,7 @@ import {
   localProxyUrl,
   socksListener,
 } from './config.mjs'
-import { MihomoRuntime, MIHOMO_VERSION, atomicJson, availablePort } from './runtime.mjs'
+import { MihomoRuntime, atomicJson, availablePort } from './runtime.mjs'
 
 export const managedProxyId = (id) => `px-${id}`
 export const managedNodeId = (id) => (/^px-mh-[a-f0-9]{24}$/.test(id || '') ? id.slice(3) : null)
@@ -37,6 +37,7 @@ export class MihomoManager {
     this.busy = false
     this.closed = false
     this.error = null
+    this.installProgress = null
     this.checks = new Map()
     this.probes = new Set()
     this.pendingChecks = new Set()
@@ -81,7 +82,10 @@ export class MihomoManager {
     return {
       installed: this.runtime.installed,
       running: this.runtime.running,
-      version: MIHOMO_VERSION,
+      version: this.runtime.version || null,
+      latest_version: this.runtime.latestVersion || null,
+      external_kernel: !!this.runtime.external,
+      install_progress: this.installProgress,
       busy: this.busy,
       error: this.error,
       download_mode: this.state.download_mode,
@@ -137,8 +141,9 @@ export class MihomoManager {
   }
 
   async restore() {
-    if (!this.state.autostart) return
     try {
+      await this.runtime.detectVersion?.()
+      if (!this.state.autostart) return
       await this.exclusive(async () => {
         await this.runtime.start(kernelConfig(this.state))
         this.syncPool()
@@ -247,31 +252,70 @@ export class MihomoManager {
     throw fault(failure.code, failure.message + '；原节点保留', failure.status)
   }
 
+  async start(next) {
+    next.download ||= await this.reserve(next)
+    await this.runtime.start(kernelConfig(next))
+    next.autostart = true
+    try {
+      atomicJson(this.file, next)
+    } catch (error) {
+      await this.runtime.stop()
+      throw error
+    }
+    this.state = next
+    this.syncPool()
+  }
+
   async perform(body) {
     return this.exclusive(async () => {
       const next = structuredClone(this.state)
       const action = body.action
+      if (action !== 'install') this.installProgress = null
       const source = next.sources.find((s) => s.id === body.id)
       const ids = [...new Set(Array.isArray(body.ids) ? body.ids : body.id ? [body.id] : [])]
       if (ids.length > 100) throw fault('too_many_targets', '单次最多操作 100 个节点')
       switch (action) {
-        case 'install':
-          await this.runtime.install()
+        case 'check_update':
+          await this.runtime.checkUpdate()
           return this.status()
-        case 'start': {
-          next.download ||= await this.reserve(next)
-          await this.runtime.start(kernelConfig(next))
-          next.autostart = true
-          try {
-            atomicJson(this.file, next)
-          } catch (e) {
-            await this.runtime.stop()
-            throw e
+        case 'install': {
+          this.installProgress = {
+            stage: 'resolving',
+            version: body.version || 'latest',
+            downloaded_bytes: 0,
+            total_bytes: null,
           }
-          this.state = next
-          this.syncPool()
-          return this.status()
+          let installed = false
+          try {
+            await this.runtime.install({
+              version: body.version ?? 'latest',
+              config: kernelConfig(next),
+              onProgress: (progress) => {
+                this.installProgress = progress
+              },
+            })
+            installed = true
+            this.installProgress = {
+              ...this.installProgress,
+              stage: 'starting',
+              version: this.runtime.version || this.installProgress.version,
+            }
+            await this.start(next)
+            this.installProgress = { ...this.installProgress, stage: 'complete' }
+            return this.status()
+          } catch (error) {
+            const message = installed
+              ? '内核已安装，但启动失败：' + (error.status ? error.message : '请检查服务器日志后重试启动')
+              : error.status
+                ? error.message
+                : '内核安装失败，请重试'
+            this.installProgress = { ...this.installProgress, stage: 'failed', message }
+            throw fault(error.code || 'kernel_install_failed', message, error.status || 500)
+          }
         }
+        case 'start':
+          await this.start(next)
+          return this.status()
         case 'stop':
           next.autostart = false
           atomicJson(this.file, next)

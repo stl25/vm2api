@@ -71,7 +71,14 @@ test('official Mihomo: independent exits, reload, fail-closed removal, stable bi
     b.close()
     fs.rmSync(dir, { recursive: true, force: true })
   })
-  if (!manager.runtime.installed) await manager.perform({ action: 'install' })
+  if (!manager.runtime.installed) {
+    await manager.perform({ action: 'install' })
+    assert.equal(manager.status().running, true, 'installation automatically starts the real kernel')
+    assert.match(manager.status().version, /^v\d+\.\d+\.\d+$/)
+    assert.equal(manager.status().install_progress.stage, 'complete')
+    assert.ok(manager.status().install_progress.downloaded_bytes > 0)
+    await manager.perform({ action: 'stop' })
+  } else await manager.runtime.detectVersion()
   for (const version of ['dual', 'ipv4', 'ipv6', 'ipv4-prefer', 'ipv6-prefer']) {
     const nodes = parseSubscription(
       JSON.stringify({ proxies: [{ type: 'http', server: 'localhost', port: a.port, 'ip-version': version }] }),

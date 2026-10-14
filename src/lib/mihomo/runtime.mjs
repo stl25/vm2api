@@ -3,24 +3,15 @@ import path from 'node:path'
 import net from 'node:net'
 import { spawn, execFile } from 'node:child_process'
 import { promisify } from 'node:util'
-import { randomBytes, createHash } from 'node:crypto'
+import { randomBytes } from 'node:crypto'
 import { gunzipSync } from 'node:zlib'
 import { setTimeout as delay } from 'node:timers/promises'
 import nodeFetch from 'node-fetch'
 import { fault } from './config.mjs'
+import { resolveMihomoRelease, downloadMihomoRelease } from './releases.mjs'
 
 const exec = promisify(execFile)
-export const MIHOMO_VERSION = 'v1.19.32'
-const RELEASES = {
-  x64: {
-    asset: 'mihomo-linux-amd64-compatible-v1.19.32.gz',
-    sha256: 'ba3ce607747a07f948fc35780e108a4a7c7f552a38b9bd4d115f313ebcb89c20',
-  },
-  arm64: {
-    asset: 'mihomo-linux-arm64-v1.19.32.gz',
-    sha256: '9dd862e28b46ff7d775f169cceebc28deccaa0a9e804237d421cd2571e0caba0',
-  },
-}
+const binaryVersion = (stdout) => /\bMihomo(?: Meta)?\s+(\S+)/i.exec(stdout)?.[1] || null
 
 export function atomicJson(file, value) {
   const tmp = `${file}.tmp`
@@ -44,10 +35,14 @@ export async function availablePort(preferred = 0) {
 }
 
 export class MihomoRuntime {
-  constructor({ dir, binary, onExit = () => {} }) {
+  constructor({ dir, binary, onExit = () => {}, fetchImpl = nodeFetch }) {
     this.dir = dir
     this.binary = binary || process.env.KIN_MIHOMO_BIN || path.join(dir, 'mihomo')
     this.onExit = onExit
+    this.fetch = fetchImpl
+    this.version = null
+    this.latestVersion = null
+    this.external = !!process.env.KIN_MIHOMO_BIN
     this.child = null
     this.port = null
     this.secret = randomBytes(24).toString('hex')
@@ -61,43 +56,65 @@ export class MihomoRuntime {
     return !!this.child && this.child.exitCode == null && !this.child.killed
   }
 
-  async install() {
-    if (this.running) throw fault('kernel_running', '请先停止内核再安装', 409)
-    if (process.env.KIN_MIHOMO_BIN) throw fault('external_kernel', 'KIN_MIHOMO_BIN 指定的内核由部署者管理', 409)
-    const release = RELEASES[process.arch]
-    if (process.platform !== 'linux' || !release)
-      throw fault('unsupported_platform', '自动安装支持 Linux amd64/arm64；开发环境可设置 KIN_MIHOMO_BIN', 409)
-    let bytes
-    try {
-      const res = await nodeFetch(
-        `https://github.com/MetaCubeX/mihomo/releases/download/${MIHOMO_VERSION}/${release.asset}`,
-        { signal: AbortSignal.timeout(90000), size: 50 * 1024 * 1024 },
-      )
-      if (!res.ok) throw new Error('download')
-      bytes = await res.buffer()
-    } catch {
-      throw fault('kernel_download_failed', 'Mihomo 下载失败，原内核未改动', 502)
+  async detectVersion() {
+    if (!this.installed) {
+      this.version = null
+      return
     }
-    if (createHash('sha256').update(bytes).digest('hex') !== release.sha256)
-      throw fault('kernel_checksum_failed', 'Mihomo 校验失败，拒绝安装', 502)
+    try {
+      const { stdout } = await exec(this.binary, ['-v'], { timeout: 10000, windowsHide: true })
+      this.version = binaryVersion(stdout)
+      if (!this.version) throw new Error('version missing')
+    } catch {
+      this.version = null
+      throw fault('kernel_version_failed', '无法读取已安装内核的版本，请重新安装或检查内核文件', 500)
+    }
+  }
+
+  async checkUpdate() {
+    const release = await resolveMihomoRelease('latest', { fetchImpl: this.fetch })
+    this.latestVersion = release.version
+    return release
+  }
+
+  async install({ version = 'latest', config, onProgress = () => {} } = {}) {
+    if (this.running) throw fault('kernel_running', '请先停止内核再安装', 409)
+    if (this.external) throw fault('external_kernel', 'KIN_MIHOMO_BIN 指定的内核由部署者管理', 409)
+    if (process.platform !== 'linux')
+      throw fault('unsupported_platform', '自动安装支持 Linux amd64/arm64；开发环境可设置 KIN_MIHOMO_BIN', 409)
+    onProgress({ stage: 'resolving', version, downloaded_bytes: 0, total_bytes: null })
+    const release =
+      version === 'latest' ? await this.checkUpdate() : await resolveMihomoRelease(version, { fetchImpl: this.fetch })
+    const bytes = await downloadMihomoRelease(release, { fetchImpl: this.fetch, onProgress })
     const candidate = `${this.binary}.download`
+    onProgress({
+      stage: 'installing',
+      version: release.version,
+      downloaded_bytes: bytes.length,
+      total_bytes: release.size,
+    })
     try {
       fs.writeFileSync(candidate, gunzipSync(bytes, { maxOutputLength: 150 * 1024 * 1024 }), { mode: 0o700 })
-      await exec(candidate, ['-v'], { timeout: 10000, windowsHide: true })
+      const { stdout } = await exec(candidate, ['-v'], { timeout: 10000, windowsHide: true })
+      if (binaryVersion(stdout) !== release.version) throw new Error('version mismatch')
+      if (config) await this.validate(config, candidate)
       fs.renameSync(candidate, this.binary)
-    } catch {
+      this.version = release.version
+    } catch (error) {
+      if (error.code === 'kernel_config_invalid')
+        throw fault('kernel_install_config_invalid', '该版本无法加载现有节点配置，原内核未改动', 400)
       throw fault('kernel_install_failed', 'Mihomo 安装失败，原内核未改动', 500)
     } finally {
       fs.rmSync(candidate, { force: true })
     }
   }
 
-  async validate(config) {
-    if (!this.installed) throw fault('kernel_missing', '请先安装 Mihomo 内核', 409)
+  async validate(config, binary = this.binary) {
+    if (!fs.existsSync(binary)) throw fault('kernel_missing', '请先安装 Mihomo 内核', 409)
     const candidate = path.join(this.dir, 'candidate.json')
     try {
       atomicJson(candidate, config)
-      await exec(this.binary, ['-t', '-d', this.dir, '-f', candidate], {
+      await exec(binary, ['-t', '-d', this.dir, '-f', candidate], {
         timeout: 15000,
         windowsHide: true,
         maxBuffer: 1024 * 1024,
@@ -149,7 +166,8 @@ export class MihomoRuntime {
     for (let i = 0; i < 50; i++) {
       if (!this.running) break
       try {
-        await this.request('GET', '/version')
+        const info = await this.request('GET', '/version')
+        this.version = info.version || this.version
         // The controller starts before listeners; a synchronous apply confirms readiness.
         await this.request('PUT', '/configs?force=true', { payload: JSON.stringify(this.controllerConfig(config)) })
         return

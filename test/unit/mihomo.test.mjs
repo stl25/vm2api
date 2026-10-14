@@ -18,6 +18,7 @@ function fixture(t, options = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'vm2api-mihomo-'))
   const runtime = {
     installed: true,
+    version: 'v1.19.31',
     running: false,
     configs: [],
     rejected: [],
@@ -33,8 +34,14 @@ function fixture(t, options = {}) {
       this.configs.push(c)
       this.rejected = reject
     },
-    async install() {
+    async install({ version, onProgress }) {
+      this.installVersion = version
+      onProgress({ stage: 'downloading', version: 'v1.19.32', downloaded_bytes: 4, total_bytes: 8 })
       this.installed = true
+      this.version = version === 'latest' ? 'v1.19.32' : version
+    },
+    async checkUpdate() {
+      this.latestVersion = 'v1.19.32'
     },
   }
   const pool = new ProxyPool({ dataDir: dir, canUseManagedProxy: (id) => id !== 'remote' })
@@ -221,4 +228,80 @@ test('quality result is based on actual target responses, not TCP greeting', asy
   assert.equal(result.success, false)
   assert.equal(result.quality.passed, 2)
   assert.equal(result.geo_ok, false)
+})
+
+test('install defaults to latest, exposes progress, starts listeners and persists autostart', async (t) => {
+  const { manager, runtime } = fixture(t)
+  const install = runtime.install.bind(runtime)
+  let proceed
+  const pending = new Promise((resolve) => {
+    proceed = resolve
+  })
+  runtime.install = async (options) => {
+    await install(options)
+    await pending
+  }
+  const work = manager.perform({ action: 'install' })
+  assert.equal(manager.status().busy, true)
+  assert.equal(manager.status().install_progress.stage, 'downloading')
+  assert.equal(manager.status().install_progress.downloaded_bytes, 4)
+  assert.equal(runtime.installVersion, 'latest')
+  proceed()
+  await work
+  assert.equal(manager.status().running, true)
+  assert.equal(manager.status().version, 'v1.19.32')
+  assert.equal(manager.status().install_progress.stage, 'complete')
+  assert.equal(JSON.parse(fs.readFileSync(manager.file, 'utf8')).autostart, true)
+  assert.equal(runtime.configs[0].listeners.length, 1)
+})
+
+test('explicit install version and live update information do not depend on a hardcoded version', async (t) => {
+  const { manager, runtime } = fixture(t)
+  await manager.perform({ action: 'check_update' })
+  assert.equal(manager.status().version, 'v1.19.31')
+  assert.equal(manager.status().latest_version, 'v1.19.32')
+  await manager.perform({ action: 'install', version: 'v1.20.1' })
+  assert.equal(runtime.installVersion, 'v1.20.1')
+  assert.equal(manager.status().version, 'v1.20.1')
+})
+
+test('download failure preserves installed version and running state, records a visible failure', async (t) => {
+  const { manager, runtime } = fixture(t)
+  runtime.install = async () => {
+    throw fault('kernel_download_failed', '下载失败', 502)
+  }
+  await assert.rejects(manager.perform({ action: 'install' }), { code: 'kernel_download_failed' })
+  assert.equal(runtime.version, 'v1.19.31')
+  assert.equal(runtime.running, false)
+  assert.equal(manager.status().install_progress.stage, 'failed')
+  assert.equal(manager.status().install_progress.message, '下载失败')
+  assert.equal(manager.status().busy, false)
+})
+
+test('startup failure distinguishes an installed kernel and permits a successful start retry', async (t) => {
+  const { manager, runtime } = fixture(t)
+  const start = runtime.start.bind(runtime)
+  runtime.start = async () => {
+    throw fault('kernel_start_failed', '监听端口不可用', 502)
+  }
+  await assert.rejects(manager.perform({ action: 'install' }), /内核已安装，但启动失败：监听端口不可用/)
+  assert.equal(manager.status().installed, true)
+  assert.equal(manager.status().running, false)
+  assert.equal(manager.state.autostart, false)
+  assert.equal(manager.status().install_progress.stage, 'failed')
+  runtime.start = start
+  await manager.perform({ action: 'start' })
+  assert.equal(manager.status().running, true)
+  assert.equal(manager.status().install_progress, null)
+  assert.equal(manager.status().error, null)
+})
+
+test('restore reads the installed version even when autostart is disabled', async (t) => {
+  const { manager, runtime } = fixture(t)
+  runtime.detectVersion = async () => {
+    runtime.version = 'v1.20.3'
+  }
+  await manager.restore()
+  assert.equal(manager.status().version, 'v1.20.3')
+  assert.equal(runtime.running, false)
 })

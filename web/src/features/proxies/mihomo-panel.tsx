@@ -1,6 +1,14 @@
 import { useEffect, useRef, useState } from 'react'
-import { useMutation, useQuery } from '@tanstack/react-query'
-import { Loader2, Play, RefreshCw, Square } from 'lucide-react'
+import { useIsMutating, useMutation, useQuery } from '@tanstack/react-query'
+import {
+  CheckCircle2,
+  Download,
+  Loader2,
+  Play,
+  RefreshCw,
+  Square,
+  XCircle,
+} from 'lucide-react'
 import { toast } from 'sonner'
 import { api } from '@/lib/api'
 import { Button } from '@/components/ui/button'
@@ -8,6 +16,7 @@ import { Input } from '@/components/ui/input'
 import { Textarea } from '@/components/ui/textarea'
 import { ConfirmDialog } from '@/components/confirm-dialog'
 import {
+  mihomoInstallFeedback,
   applyMihomoBatches,
   runMihomoChecks,
   type CheckProgress,
@@ -27,14 +36,18 @@ type Action = {
   url?: string
   text?: string
   mode?: string
+  version?: string
 }
 const selectStyle = 'bg-background h-9 rounded-md border px-2 text-sm'
 
 export function MihomoPanel() {
+  const [kernelVersion, setKernelVersion] = useState('latest')
+  const activeOperations = useIsMutating({ mutationKey: ['panel', 'mihomo'] })
   const query = useQuery({
     queryKey: ['panel', 'mihomo'],
     queryFn: () => api<MihomoStatus>('/api/panel/mihomo'),
-    refetchInterval: 5000,
+    refetchInterval: (query) =>
+      activeOperations || query.state.data?.busy ? 500 : 5000,
   })
   const refreshProxies = useRefreshProxies()
   const [filters, setFilters] = useState({
@@ -62,9 +75,11 @@ export function MihomoPanel() {
     []
   )
   const operation = useMutation({
+    mutationKey: ['panel', 'mihomo'],
     mutationFn: async (body: Action) => {
       setConfirm(null)
       setProgress(null)
+      if (body.action === 'install') void query.refetch()
       if (['test', 'quality'].includes(body.action)) {
         cancelChecks.current = false
         return runMihomoChecks(
@@ -106,7 +121,13 @@ export function MihomoPanel() {
           (result.cancelled ? '；其余未检测' : '')
         if (result.failed || result.cancelled) toast.warning(message)
         else toast.success(message)
-      } else toast.success('操作已应用')
+      } else if (body.action === 'install')
+        toast.success('内核安装完成并已启动')
+      else if (body.action === 'check_update')
+        toast.success('已获取官方最新稳定版本')
+      else if (body.action === 'start') toast.success('内核已启动')
+      else if (body.action === 'stop') toast.success('内核已停止')
+      else toast.success('操作已应用')
       setConfirm(null)
       if (
         [
@@ -128,6 +149,13 @@ export function MihomoPanel() {
   })
   const status = query.data
   const busy = operation.isPending || !!status?.busy || !status
+  const installingRequest =
+    operation.isPending && operation.variables?.action === 'install'
+  const install =
+    installingRequest && !status?.busy ? null : status?.install_progress
+  const installFeedback = install ? mihomoInstallFeedback(install) : null
+  const installing =
+    installingRequest || (!!status?.busy && !!installFeedback?.active)
   const rows = filterMihomoNodes(status?.nodes || [], filters)
   const targets = selectedMihomoNodes(rows, selected)
   const countries = [
@@ -185,20 +213,14 @@ export function MihomoPanel() {
               ? '正在加载状态'
               : !status
                 ? '状态加载失败'
-                : status.running
-                  ? '内核运行中'
-                  : status?.installed
-                    ? '内核已停止'
-                    : '尚未安装内核'}
+                : installing
+                  ? '正在安装并启动'
+                  : status.running
+                    ? '内核运行中'
+                    : status?.installed
+                      ? '内核已停止'
+                      : '尚未安装内核'}
           </span>
-          <Button
-            size='sm'
-            variant='outline'
-            disabled={busy || !!status?.running}
-            onClick={() => operation.mutate({ action: 'install' })}
-          >
-            安装 {status?.version || '内核'}
-          </Button>
           {status?.running ? (
             <Button
               size='sm'
@@ -234,25 +256,165 @@ export function MihomoPanel() {
           </Button>
         </div>
       </div>
+      <div className='space-y-3 rounded-lg border bg-muted/30 p-3'>
+        <div className='flex flex-wrap items-center gap-x-4 gap-y-2 text-sm'>
+          <span>
+            当前内核：
+            <strong>
+              {!status
+                ? '正在读取'
+                : status.installed
+                  ? status.version || '版本未知'
+                  : '未安装'}
+            </strong>
+          </span>
+          <span className='text-muted-foreground'>
+            最新稳定版：{status?.latest_version || '尚未检查'}
+          </span>
+          <Button
+            size='sm'
+            variant='ghost'
+            disabled={busy}
+            onClick={() => operation.mutate({ action: 'check_update' })}
+          >
+            <RefreshCw
+              className={
+                operation.isPending &&
+                operation.variables?.action === 'check_update'
+                  ? 'animate-spin motion-reduce:animate-none'
+                  : ''
+              }
+              aria-hidden='true'
+            />
+            {operation.isPending &&
+            operation.variables?.action === 'check_update'
+              ? '正在检查'
+              : '检查更新'}
+          </Button>
+        </div>
+        {status?.external_kernel ? (
+          <p className='text-sm text-muted-foreground'>
+            内核由服务器配置 KIN_MIHOMO_BIN 管理，请通过部署配置更新。
+          </p>
+        ) : (
+          <div className='flex flex-wrap items-end gap-2'>
+            <label className='flex flex-col gap-1 text-sm'>
+              安装版本
+              <Input
+                aria-label='安装版本'
+                className='w-44'
+                placeholder='latest 或 v1.19.32'
+                value={kernelVersion}
+                disabled={busy || !!status?.running}
+                onChange={(event) => setKernelVersion(event.target.value)}
+              />
+            </label>
+            <Button
+              size='sm'
+              disabled={busy || !!status?.running || !kernelVersion.trim()}
+              onClick={() =>
+                operation.mutate({
+                  action: 'install',
+                  version: kernelVersion.trim(),
+                })
+              }
+            >
+              {installing ? (
+                <Loader2
+                  className='animate-spin motion-reduce:animate-none'
+                  aria-hidden='true'
+                />
+              ) : (
+                <Download aria-hidden='true' />
+              )}
+              {installing
+                ? '正在安装并启动'
+                : status?.installed
+                  ? '更新并启动'
+                  : '安装并启动'}
+            </Button>
+            <p className='pb-1 text-xs text-muted-foreground'>
+              {status?.running
+                ? '更新前先停止内核。'
+                : 'latest 获取官方最新稳定版；安装成功后自动启动。'}
+            </p>
+          </div>
+        )}
+        {(installing || install) && (
+          <div
+            className='space-y-2 rounded-md border bg-background p-3'
+            role={install?.stage === 'failed' ? 'alert' : 'status'}
+            aria-live='polite'
+          >
+            <div className='flex items-center gap-2 text-sm'>
+              {installing ? (
+                <Loader2
+                  className='size-4 animate-spin motion-reduce:animate-none'
+                  aria-hidden='true'
+                />
+              ) : install?.stage === 'complete' ? (
+                <CheckCircle2
+                  className='size-4 text-green-600'
+                  aria-hidden='true'
+                />
+              ) : (
+                <XCircle
+                  className='size-4 text-destructive'
+                  aria-hidden='true'
+                />
+              )}
+              <span>
+                {installing && !installFeedback?.active
+                  ? '正在准备安装'
+                  : installFeedback?.label || '正在准备安装'}
+                {install?.version && install.version !== 'latest'
+                  ? ' · ' + install.version
+                  : ''}
+              </span>
+            </div>
+            {install?.stage === 'downloading' && installFeedback && (
+              <>
+                <progress
+                  className='h-2 w-full accent-primary'
+                  aria-label='内核下载进度'
+                  max={100}
+                  value={installFeedback.percent ?? undefined}
+                />
+                <p className='text-xs text-muted-foreground'>
+                  {installFeedback.bytes}
+                  {installFeedback.percent !== null
+                    ? '（' + installFeedback.percent + '%）'
+                    : ''}
+                </p>
+              </>
+            )}
+            {install?.message && (
+              <p className='text-sm text-destructive'>{install.message}</p>
+            )}
+          </div>
+        )}
+      </div>
       {query.error && (
         <p role='alert' className='text-sm text-destructive'>
           {query.error.message}
         </p>
       )}
-      {status?.error && (
+      {status?.error && status.error !== install?.message && (
         <p role='alert' className='text-sm text-destructive'>
           {status.error}
         </p>
       )}
-      {operation.isPending && !progress && (
-        <p role='status' className='flex items-center gap-2 text-sm'>
-          <Loader2
-            className='size-4 animate-spin motion-reduce:animate-none'
-            aria-hidden='true'
-          />
-          正在应用操作…
-        </p>
-      )}
+      {operation.isPending &&
+        !progress &&
+        operation.variables?.action !== 'install' && (
+          <p role='status' className='flex items-center gap-2 text-sm'>
+            <Loader2
+              className='size-4 animate-spin motion-reduce:animate-none'
+              aria-hidden='true'
+            />
+            正在应用操作…
+          </p>
+        )}
       {progress && (
         <div
           className='flex flex-wrap items-center gap-3 text-sm'
