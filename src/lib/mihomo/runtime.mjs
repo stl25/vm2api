@@ -150,6 +150,8 @@ export class MihomoRuntime {
       if (!this.running) break
       try {
         await this.request('GET', '/version')
+        // The controller starts before listeners; a synchronous apply confirms readiness.
+        await this.request('PUT', '/configs?force=true', { payload: JSON.stringify(this.controllerConfig(config)) })
         return
       } catch {
         await delay(100)

@@ -80,7 +80,15 @@ test('official Mihomo: independent exits, reload, fail-closed removal, stable bi
   }
   await manager.perform({ action: 'dynamic_add', text: `http://127.0.0.1:${a.port}#A\nhttp://127.0.0.1:${b.port}#B` })
   const [idA, idB] = manager.status().nodes.map((n) => n.id)
+  let confirmedApplies = 0
+  const controlRequest = manager.runtime.request.bind(manager.runtime)
+  manager.runtime.request = async (method, route, body) => {
+    const result = await controlRequest(method, route, body)
+    if (method === 'PUT' && route === '/configs?force=true') confirmedApplies++
+    return result
+  }
   await manager.perform({ action: 'start' })
+  assert.equal(confirmedApplies, 1, 'startup must wait for configuration and listeners, not just /version')
   await manager.perform({ action: 'node_export', ids: [idA, idB] })
   const first = structuredClone(manager.state.bindings)
   assert.equal(await through(first[idA]), 'A')
