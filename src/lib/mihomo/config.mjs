@@ -22,7 +22,6 @@ const UNSAFE_KEYS = new Set([
   'dialer-proxy',
   'interface-name',
   'routing-mark',
-  'ip-version',
   'certificate',
   'private-key',
   'client-auth-cert',
@@ -55,6 +54,11 @@ export function normalizeNode(raw) {
       throw fault('unsafe_node', '节点包含链式代理、接口覆盖或本地文件配置，请先移除这些字段')
   if (raw.plugin && !['obfs', 'v2ray-plugin', 'shadow-tls', 'restls'].includes(raw.plugin))
     throw fault('unsafe_node', '不支持此节点插件')
+  if (
+    raw['ip-version'] !== undefined &&
+    !['dual', 'ipv4', 'ipv6', 'ipv4-prefer', 'ipv6-prefer'].includes(raw['ip-version'])
+  )
+    throw fault('invalid_node', '节点 ip-version 必须为 dual、ipv4、ipv6、ipv4-prefer 或 ipv6-prefer')
   const { name, ...config } = raw
   config.server = config.server.trim()
   config.port = port
@@ -76,7 +80,13 @@ export function parseSubscription(text) {
   }
   if (!Array.isArray(value?.proxies) || !value.proxies.length || value.proxies.length > MAX_NODES)
     throw fault('invalid_subscription', '订阅必须包含 1–4096 个 proxies 节点')
-  const nodes = value.proxies.map(normalizeNode)
+  const nodes = value.proxies.map((raw, index) => {
+    try {
+      return normalizeNode(raw)
+    } catch (error) {
+      throw fault(error.code, '第 ' + (index + 1) + ' 个节点：' + error.message)
+    }
+  })
   return [...new Map(nodes.map((n) => [n.id, n])).values()]
 }
 

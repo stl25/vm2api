@@ -1,6 +1,6 @@
 export type MihomoCheck = {
   success: boolean
-  latency_ms: number
+  latency_ms: number | null
   checked_at?: string
   geo?: { ip?: string; country?: string; country_code?: string }
   quality?: { passed: number; total: number; summary: string }
@@ -13,6 +13,12 @@ export type MihomoNode = {
   dynamic: boolean
   source_ids: string[]
   proxy_id: string | null
+  outlet?: {
+    enabled: boolean
+    status: string
+    error: string | null
+    bound_count: number
+  } | null
   check: MihomoCheck | null
 }
 export type MihomoSource = {
@@ -49,4 +55,83 @@ export function filterMihomoNodes(
 export function selectedMihomoNodes(nodes: MihomoNode[], ids: string[]) {
   const selected = new Set(ids)
   return nodes.filter((n) => selected.has(n.id)).map((n) => n.id)
+}
+
+export type CheckProgress = {
+  total: number
+  completed: number
+  succeeded: number
+  failed: number
+  active: string[]
+  cancelled: boolean
+}
+
+export async function runMihomoChecks(
+  ids: string[],
+  check: (id: string) => Promise<{ success: boolean }>,
+  options: {
+    isCancelled: () => boolean
+    onProgress: (progress: CheckProgress) => void
+  }
+) {
+  let cursor = 0
+  const progress: CheckProgress = {
+    total: ids.length,
+    completed: 0,
+    succeeded: 0,
+    failed: 0,
+    active: [],
+    cancelled: false,
+  }
+  const report = () =>
+    options.onProgress({ ...progress, active: [...progress.active] })
+  report()
+  await Promise.all(
+    Array.from({ length: Math.min(4, ids.length) }, async () => {
+      while (cursor < ids.length && !options.isCancelled()) {
+        const id = ids[cursor++]
+        progress.active.push(id)
+        report()
+        try {
+          const result = await check(id)
+          if (result.success) progress.succeeded++
+          else progress.failed++
+        } catch {
+          progress.failed++
+        } finally {
+          progress.completed++
+          progress.active = progress.active.filter((active) => active !== id)
+          report()
+        }
+      }
+    })
+  )
+  progress.cancelled = progress.completed < progress.total
+  report()
+  return progress
+}
+
+export async function applyMihomoBatches(
+  ids: string[],
+  apply: (ids: string[]) => Promise<unknown>
+) {
+  for (let start = 0; start < ids.length; start += 100) {
+    const batch = ids.slice(start, start + 100)
+    try {
+      await apply(batch)
+    } catch (error) {
+      const message = error instanceof Error ? error.message : '请求失败'
+      const failure = new Error(
+        '已应用 ' +
+          start +
+          ' 个；本批 ' +
+          batch.length +
+          ' 个未确认成功；后续 ' +
+          (ids.length - start - batch.length) +
+          ' 个未处理。' +
+          message
+      )
+      throw Object.assign(failure, { cause: error })
+    }
+  }
 }

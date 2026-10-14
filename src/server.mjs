@@ -61,6 +61,7 @@ import {
   getVm,
   getActiveVmId,
   setVmSchedulable,
+  disableVmForProxy,
   isCodexVm,
   syncCodexQuotaSchedule,
 } from './lib/vm/vm-registry.mjs'
@@ -334,7 +335,7 @@ proxyPool = new ProxyPool({
   dataDir,
   canUseManagedProxy: (vmId) => !getVm(cfg.paths.project, vmId)?.node_id,
   onDisableVm: (vmId, reason, proxyId) => {
-    setVmSchedulable(cfg.paths.project, vmId, false, `${reason}|proxy=${proxyId}`)
+    disableVmForProxy(cfg.paths.project, vmId, reason, proxyId)
   },
   onDisconnectVm: (vmId, reason, proxyId) => {
     setVmSchedulable(cfg.paths.project, vmId, false, `${reason}|proxy=${proxyId}`)
@@ -513,6 +514,7 @@ const backupService = new BackupService({
   dataDir,
   projectRoot: cfg.paths.project,
   configDir: path.dirname(routingConfigPath),
+  mihomo,
 })
 backupService.onRestored((db) => {
   // A restore swaps the DatabaseSync instance and routing files. Rebuild every
@@ -940,7 +942,11 @@ const server = http.createServer(async (req, res) => {
 
     if (
       backupService.isRestoring &&
-      (p.startsWith('/v1/') || p === '/messages' || p === '/chat/completions' || p === '/responses')
+      (p.startsWith('/api/panel') ||
+        p.startsWith('/v1/') ||
+        p === '/messages' ||
+        p === '/chat/completions' ||
+        p === '/responses')
     ) {
       return json(
         res,

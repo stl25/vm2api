@@ -1,5 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import {
+  applyMihomoBatches,
+  runMihomoChecks,
   filterMihomoNodes,
   selectedMihomoNodes,
   type MihomoNode,
@@ -46,5 +48,60 @@ describe('Mihomo node selection', () => {
         country: '',
       }).map((n) => n.id)
     ).toEqual(['US'])
+  })
+})
+
+describe('Mihomo batch operations', () => {
+  it('limits checks to four concurrent requests and counts unsuccessful responses', async () => {
+    let active = 0
+    let peak = 0
+    const result = await runMihomoChecks(
+      Array.from({ length: 10 }, (_, i) => String(i)),
+      async (id) => {
+        active++
+        peak = Math.max(peak, active)
+        await Promise.resolve()
+        active--
+        if (id === '1') throw new Error('network')
+        return { success: id !== '2' }
+      },
+      { isCancelled: () => false, onProgress: () => {} }
+    )
+    expect(peak).toBe(4)
+    expect(result).toMatchObject({
+      completed: 10,
+      succeeded: 8,
+      failed: 2,
+      cancelled: false,
+      active: [],
+    })
+  })
+  it('cancels pending checks while allowing in-flight checks to finish', async () => {
+    let cancelled = false
+    const seen: string[] = []
+    const result = await runMihomoChecks(
+      ['a', 'b', 'c', 'd', 'e', 'f'],
+      async (id) => {
+        seen.push(id)
+        await Promise.resolve()
+        cancelled = true
+        return { success: true }
+      },
+      { isCancelled: () => cancelled, onProgress: () => {} }
+    )
+    expect(seen).toEqual(['a', 'b', 'c', 'd'])
+    expect(result).toMatchObject({ completed: 4, total: 6, cancelled: true })
+  })
+  it('reports confirmed changes, an uncertain failed batch and untouched targets', async () => {
+    let calls = 0
+    await expect(
+      applyMihomoBatches(
+        Array.from({ length: 250 }, (_, i) => String(i)),
+        async () => {
+          if (++calls === 2) throw new Error('timeout')
+        }
+      )
+    ).rejects.toThrow('已应用 100 个；本批 100 个未确认成功；后续 50 个未处理')
+    expect(calls).toBe(2)
   })
 })

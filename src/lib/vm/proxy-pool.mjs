@@ -317,6 +317,7 @@ export class ProxyPool extends EventEmitter {
     this.onDisconnectVm = onDisconnectVm // (vmId, reason, proxyId) => void — experimental tear-down
     this.onEnableVm = onEnableVm // (vmId, reason, proxyId) => void
     this.canUseManagedProxy = canUseManagedProxy || (() => true)
+    this.managedBusy = false
     this.egressCheck = egressCheck
     this.repairEgress = repairEgress
     // Injectable so geo detection is testable without leaving the machine.
@@ -479,32 +480,39 @@ export class ProxyPool extends EventEmitter {
     }
   }
 
-  upsertManaged(record) {
-    let p = this.state.proxies.find((p) => p.id === record.id)
-    if (!p) {
-      p = {
-        ...record,
-        scheme: 'socks5',
-        status: 'unknown',
-        owner_user_id: null,
-        bound_vm_id: null,
-        bound_vm_ids: [],
-        created_at: new Date().toISOString(),
+  syncManaged(records) {
+    let changed = false
+    for (const record of records) {
+      let p = this.state.proxies.find((p) => p.id === record.id)
+      const before = p && JSON.stringify(p)
+      if (!p) {
+        p = {
+          ...record,
+          scheme: 'socks5',
+          status: 'unknown',
+          owner_user_id: null,
+          bound_vm_id: null,
+          bound_vm_ids: [],
+          created_at: new Date().toISOString(),
+        }
+        this.state.proxies.push(p)
       }
-      this.state.proxies.push(p)
+      const wasEnabled = p.enabled
+      const { label: _defaultLabel, ...connection } = record
+      Object.assign(p, connection)
+      if (!p.enabled) {
+        const newlyUnavailable = p.last_error !== 'mihomo_unavailable'
+        p.status = 'dead'
+        p.last_error = 'mihomo_unavailable'
+        if (newlyUnavailable) this._cascadeDisableVm(p, 'mihomo_unavailable')
+      } else if (!wasEnabled) {
+        p.status = 'unknown'
+        p.consecutive_failures = 0
+        // Keep the failure until a successful probe can resume affected slots.
+      }
+      changed ||= before !== JSON.stringify(p)
     }
-    const wasEnabled = p.enabled
-    Object.assign(p, record)
-    if (!p.enabled) {
-      p.status = 'dead'
-      this._cascadeDisableVm(p, 'mihomo_unavailable')
-    } else if (!wasEnabled || p.status === 'dead') {
-      p.status = 'unknown'
-      p.consecutive_failures = 0
-      p.last_error = null
-    }
-    this.save()
-    return this.publicProxy(p)
+    if (changed) this.save()
   }
 
   ensureLocal() {
@@ -688,6 +696,7 @@ export class ProxyPool extends EventEmitter {
   }
 
   bind(proxyId, vmId) {
+    if (managedNodeId(proxyId) && this.managedBusy) return { ok: false, error: 'mihomo_busy' }
     if (managedNodeId(proxyId) && !this.canUseManagedProxy(vmId))
       return { ok: false, error: 'mihomo_requires_local_slot' }
     const p = this.state.proxies.find((x) => x.id === proxyId)
@@ -697,6 +706,10 @@ export class ProxyPool extends EventEmitter {
     if (blocked) return { ok: false, error: blocked }
     const vm = String(vmId || '').trim()
     if (!vm) return { ok: false, error: 'vm_id_required' }
+    const ids = boundVmIdsOf(p)
+    const limit = this.bindLimit()
+    if (!ids.includes(vm) && ids.length >= limit)
+      return { ok: false, error: 'proxy_bind_limit', max: limit, bound_vm_ids: ids }
     for (const x of this.state.proxies) {
       if (x.id === proxyId) continue
       const ids = boundVmIdsOf(x)
@@ -706,16 +719,7 @@ export class ProxyPool extends EventEmitter {
           ids.filter((id) => id !== vm),
         )
     }
-    const ids = boundVmIdsOf(p)
-    if (ids.includes(vm)) {
-      this.save()
-      return { ok: true, proxy: this.publicProxy(p) }
-    }
-    const limit = this.bindLimit()
-    if (ids.length >= limit) {
-      return { ok: false, error: 'proxy_bind_limit', max: limit, bound_vm_ids: ids }
-    }
-    setBoundVmIds(p, [...ids, vm])
+    if (!ids.includes(vm)) setBoundVmIds(p, [...ids, vm])
     this.save()
     return { ok: true, proxy: this.publicProxy(p) }
   }
@@ -1235,6 +1239,7 @@ export class ProxyPool extends EventEmitter {
   _applyProbeResultInner(p, result, { cascade = true } = {}) {
     // Disabled by policy is not a failed probe and must not damage health/history.
     if (result.scope === 'policy' || proxyBlockedReason(p, this.state.config.ipv6_enabled)) return
+    if (managedNodeId(p.id) && !p.enabled && p.last_error === 'mihomo_unavailable') return
     p.last_probe_at = new Date().toISOString()
     p.latency_ms = result.latency_ms
     if (result.scope === 'egress') {
@@ -1245,7 +1250,7 @@ export class ProxyPool extends EventEmitter {
     }
     if (result.ok) {
       const resume =
-        /egress_down|proxy_probe_failed/.test(String(p.last_error || '')) ||
+        /egress_down|proxy_probe_failed|mihomo_unavailable/.test(String(p.last_error || '')) ||
         p.status === 'fail' ||
         (p.status === 'dead' && !!p.last_error)
       p.status = 'ok'

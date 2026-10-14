@@ -7,7 +7,7 @@ import http from 'node:http'
 import { once } from 'node:events'
 import nodeFetch from 'node-fetch'
 import { MihomoManager, managedProxyId } from '../../src/lib/mihomo/manager.mjs'
-import { localProxyUrl } from '../../src/lib/mihomo/config.mjs'
+import { kernelConfig, parseSubscription, localProxyUrl } from '../../src/lib/mihomo/config.mjs'
 import { createProxyAgent } from '../../src/lib/vm/proxy-agent.mjs'
 import { ProxyPool } from '../../src/lib/vm/proxy-pool.mjs'
 
@@ -72,6 +72,12 @@ test('official Mihomo: independent exits, reload, fail-closed removal, stable bi
     fs.rmSync(dir, { recursive: true, force: true })
   })
   if (!manager.runtime.installed) await manager.perform({ action: 'install' })
+  for (const version of ['dual', 'ipv4', 'ipv6', 'ipv4-prefer', 'ipv6-prefer']) {
+    const nodes = parseSubscription(
+      JSON.stringify({ proxies: [{ type: 'http', server: 'localhost', port: a.port, 'ip-version': version }] }),
+    )
+    await manager.runtime.validate(kernelConfig({ sources: [{ nodes, enabled: true }], disabled: [], bindings: {} }))
+  }
   await manager.perform({ action: 'dynamic_add', text: `http://127.0.0.1:${a.port}#A\nhttp://127.0.0.1:${b.port}#B` })
   const [idA, idB] = manager.status().nodes.map((n) => n.id)
   await manager.perform({ action: 'start' })

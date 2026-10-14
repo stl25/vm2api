@@ -39,6 +39,7 @@ export class MihomoManager {
     this.error = null
     this.checks = new Map()
     this.probes = new Set()
+    this.pendingChecks = new Set()
     this.probeRuntimes = new Set()
     this.abort = new AbortController()
     this.runtime =
@@ -51,16 +52,32 @@ export class MihomoManager {
           this.syncPool()
         },
       })
-    this.state = fs.existsSync(this.file)
+    this.state = this.readState()
+    this.syncPool()
+  }
+
+  readState() {
+    const state = fs.existsSync(this.file)
       ? JSON.parse(fs.readFileSync(this.file, 'utf8'))
       : { version: 1, autostart: false, download_mode: 'auto', sources: [], disabled: [], bindings: {}, download: null }
-    if (this.state.version !== 1 || !Array.isArray(this.state.sources) || !this.state.bindings)
+    if (state.version !== 1 || !Array.isArray(state.sources) || !state.bindings)
       throw fault('invalid_state', 'Mihomo 配置无法读取，拒绝覆盖已有数据', 500)
-    this.syncPool()
+    return state
+  }
+
+  async reload() {
+    this.state = this.readState()
+    this.checks.clear()
+    try {
+      if (this.state.autostart) await this.runtime.start(kernelConfig(this.state))
+    } finally {
+      this.syncPool()
+    }
   }
 
   status() {
     const nodes = [...collectNodes(this.state).values()]
+    const proxies = new Map((this.pool?.snapshot().proxies || []).map((p) => [p.id, p]))
     return {
       installed: this.runtime.installed,
       running: this.runtime.running,
@@ -76,25 +93,37 @@ export class MihomoManager {
         nodes: s.nodes.length,
         updated_at: s.updated_at,
       })),
-      nodes: nodes.map((n) => ({
-        id: n.id,
-        label: n.label,
-        type: n.config.type,
-        enabled: n.enabled,
-        dynamic: n.dynamic,
-        source_ids: n.source_ids,
-        proxy_id: this.state.bindings[n.id]?.exported ? managedProxyId(n.id) : null,
-        check: this.checks.get(n.id) || null,
-      })),
+      nodes: nodes.map((n) => {
+        const proxy = proxies.get(managedProxyId(n.id))
+        return {
+          id: n.id,
+          label: n.label,
+          type: n.config.type,
+          enabled: n.enabled,
+          dynamic: n.dynamic,
+          source_ids: n.source_ids,
+          proxy_id: this.state.bindings[n.id]?.exported ? managedProxyId(n.id) : null,
+          outlet: this.state.bindings[n.id]?.exported
+            ? {
+                enabled: !!proxy?.enabled,
+                status: proxy?.status || 'unknown',
+                error: proxy?.last_error || null,
+                bound_count: proxy?.bound_count || 0,
+              }
+            : null,
+          check: this.checks.get(n.id) || null,
+        }
+      }),
     }
   }
 
   syncPool() {
     if (!this.pool) return
     const nodes = collectNodes(this.state)
+    const records = []
     for (const [id, b] of Object.entries(this.state.bindings)) {
       if (!b.exported) continue
-      this.pool.upsertManaged({
+      records.push({
         id: managedProxyId(id),
         host: '127.0.0.1',
         port: b.port,
@@ -104,6 +133,7 @@ export class MihomoManager {
         enabled: !!(this.runtime.running && b.active && nodes.get(id)?.enabled),
       })
     }
+    this.pool.syncManaged(records)
   }
 
   async restore() {
@@ -118,19 +148,22 @@ export class MihomoManager {
     }
   }
 
-  async exclusive(work) {
+  async exclusive(work, { preserveError = false } = {}) {
     if (this.closed) throw fault('closed', 'Mihomo 管理器已关闭', 409)
     if (this.busy) throw fault('busy', 'Mihomo 正在处理操作，请稍后再试', 409)
     this.busy = true
     this.error = null
+    if (this.pool) this.pool.managedBusy = true
     try {
       this.work = work()
       return await this.work
     } catch (error) {
+      if (preserveError) throw error
       this.error = error.code && error.status ? error.message : 'Mihomo 操作失败，未应用新配置'
       if (error.code && error.status) throw error
       throw fault('mihomo_operation_failed', this.error, 500)
     } finally {
+      if (this.pool) this.pool.managedBusy = false
       this.busy = false
       this.work = null
     }
@@ -182,6 +215,7 @@ export class MihomoManager {
     if (mode === 'proxy' && !via)
       throw fault('download_proxy_unavailable', '仅代理下载需要运行中的 Mihomo；不会回退直连', 409)
     const routes = mode === 'direct' ? [null] : mode === 'proxy' ? [via] : via ? [via, null] : [null]
+    let failure
     for (const route of routes) {
       const agent = route ? createProxyAgent(route) : null
       try {
@@ -193,15 +227,24 @@ export class MihomoManager {
           agent: agent || undefined,
           headers: { 'user-agent': 'mihomo/vm2api', accept: 'text/yaml,application/yaml,text/plain' },
         })
-        if (!response.ok) throw new Error('status')
+        if (!response.ok)
+          throw fault(
+            'subscription_http_failed',
+            response.status === 401 || response.status === 403
+              ? '订阅认证失败，请检查订阅地址是否有效或已过期'
+              : '订阅服务器返回 HTTP ' + response.status,
+            502,
+          )
         return parseSubscription(await response.text())
-      } catch {
-        /* auto may try its explicit direct fallback */
+      } catch (error) {
+        failure = error.status
+          ? error
+          : fault('subscription_download_failed', '订阅下载失败，请检查网络或下载模式', 502)
       } finally {
         agent?.destroy()
       }
     }
-    throw fault('subscription_download_failed', '订阅下载或格式校验失败；原节点保留，订阅应为 Clash/Mihomo YAML', 502)
+    throw fault(failure.code, failure.message + '；原节点保留', failure.status)
   }
 
   async perform(body) {
@@ -347,6 +390,17 @@ export class MihomoManager {
   }
 
   async test(id, quality = false) {
+    if (this.busy) throw fault('busy', 'Mihomo 正在处理操作，请稍后再试', 409)
+    const task = this.runTest(id, quality)
+    this.pendingChecks.add(task)
+    try {
+      return await task
+    } finally {
+      this.pendingChecks.delete(task)
+    }
+  }
+
+  async runTest(id, quality) {
     if (this.closed) throw fault('closed', 'Mihomo 管理器已关闭', 409)
     const node = collectNodes(this.state).get(id)
     if (!node) throw fault('node_not_found', '节点不存在', 404)
@@ -369,9 +423,12 @@ export class MihomoManager {
         await runtime.start(config)
         result = await checkExit(localProxyUrl(b), quality)
       }
-      if (collectNodes(this.state).has(id))
-        this.checks.set(id, { ...this.checks.get(id), ...result, checked_at: new Date().toISOString() })
+      if (collectNodes(this.state).has(id)) this.checks.set(id, { ...result, checked_at: new Date().toISOString() })
       return result
+    } catch (error) {
+      if (collectNodes(this.state).has(id))
+        this.checks.set(id, { success: false, latency_ms: null, geo_ok: false, checked_at: new Date().toISOString() })
+      throw error
     } finally {
       await runtime?.stop()
       this.probeRuntimes.delete(runtime)
@@ -385,6 +442,7 @@ export class MihomoManager {
     this.abort.abort()
     await this.work?.catch(() => {})
     await Promise.all([...this.probeRuntimes].map((runtime) => runtime.stop()))
+    await Promise.allSettled(this.pendingChecks)
     await this.runtime.stop()
   }
 }

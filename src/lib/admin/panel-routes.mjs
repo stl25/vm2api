@@ -1810,7 +1810,7 @@ export function createPanelHandler(ctx) {
           })
         }
         try {
-          const out = backupService.restoreBackup(id)
+          const out = await backupService.restoreBackup(id)
           return json(res, 200, { ok: true, ...out })
         } catch (e) {
           const map = {
@@ -1819,6 +1819,8 @@ export function createPanelHandler(ctx) {
             restore_in_progress: 409,
             backup_corrupt: 422,
             backup_not_ok: 422,
+            backup_mihomo_missing: 422,
+            busy: 409,
           }
           return json(res, map[e.code] || 500, {
             ok: false,

@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useMutation, useQuery } from '@tanstack/react-query'
 import { Loader2, Play, RefreshCw, Square } from 'lucide-react'
 import { toast } from 'sonner'
@@ -8,6 +8,10 @@ import { Input } from '@/components/ui/input'
 import { Textarea } from '@/components/ui/textarea'
 import { ConfirmDialog } from '@/components/confirm-dialog'
 import {
+  applyMihomoBatches,
+  runMihomoChecks,
+  type CheckProgress,
+  type MihomoCheck,
   filterMihomoNodes,
   selectedMihomoNodes,
   type MihomoStatus,
@@ -49,43 +53,60 @@ export function MihomoPanel() {
     body: Action
     message: string
   } | null>(null)
+  const cancelChecks = useRef(false)
+  const [progress, setProgress] = useState<CheckProgress | null>(null)
+  useEffect(
+    () => () => {
+      cancelChecks.current = true
+    },
+    []
+  )
   const operation = useMutation({
     mutationFn: async (body: Action) => {
-      if (body.ids?.length && ['test', 'quality'].includes(body.action)) {
-        let failed = 0
-        for (const id of body.ids) {
-          try {
-            await api('/api/panel/mihomo', {
+      setConfirm(null)
+      setProgress(null)
+      if (['test', 'quality'].includes(body.action)) {
+        cancelChecks.current = false
+        return runMihomoChecks(
+          body.ids || (body.id ? [body.id] : []),
+          (id) =>
+            api<MihomoCheck>('/api/panel/mihomo', {
               method: 'POST',
               body: JSON.stringify({ action: body.action, id }),
-            })
-          } catch {
-            failed++
-          }
-        }
-        if (failed)
-          throw new Error(`${failed} 个节点未能完成检测，其余结果已保存`)
-      } else {
-        const targets = body.ids
-        if (targets?.length) {
-          for (let i = 0; i < targets.length; i += 100)
-            await api('/api/panel/mihomo', {
-              method: 'POST',
-              body: JSON.stringify({ ...body, ids: targets.slice(i, i + 100) }),
-            })
-        } else
-          await api('/api/panel/mihomo', {
+            }),
+          { isCancelled: () => cancelChecks.current, onProgress: setProgress }
+        )
+      }
+      if (body.ids?.length) {
+        await applyMihomoBatches(body.ids, (ids) =>
+          api('/api/panel/mihomo', {
             method: 'POST',
-            body: JSON.stringify(body),
+            body: JSON.stringify({ ...body, ids }),
           })
+        )
+      } else {
+        await api('/api/panel/mihomo', {
+          method: 'POST',
+          body: JSON.stringify(body),
+        })
       }
     },
-    onSuccess: (_data, body) => {
-      toast.success(
-        ['test', 'quality'].includes(body.action)
-          ? '检测已完成，请查看各节点结果'
-          : '操作已应用'
-      )
+    onSuccess: (result, body) => {
+      if (result) {
+        const message =
+          '已检测 ' +
+          result.completed +
+          '/' +
+          result.total +
+          ' 个，成功 ' +
+          result.succeeded +
+          ' 个，失败 ' +
+          result.failed +
+          ' 个' +
+          (result.cancelled ? '；其余未检测' : '')
+        if (result.failed || result.cancelled) toast.warning(message)
+        else toast.success(message)
+      } else toast.success('操作已应用')
       setConfirm(null)
       if (
         [
@@ -106,7 +127,7 @@ export function MihomoPanel() {
     },
   })
   const status = query.data
-  const busy = operation.isPending || !!status?.busy
+  const busy = operation.isPending || !!status?.busy || !status
   const rows = filterMihomoNodes(status?.nodes || [], filters)
   const targets = selectedMihomoNodes(rows, selected)
   const countries = [
@@ -160,11 +181,15 @@ export function MihomoPanel() {
         </div>
         <div className='flex flex-wrap items-center gap-2'>
           <span className='text-sm' role='status'>
-            {status?.running
-              ? '内核运行中'
-              : status?.installed
-                ? '内核已停止'
-                : '尚未安装内核'}
+            {query.isPending
+              ? '正在加载状态'
+              : !status
+                ? '状态加载失败'
+                : status.running
+                  ? '内核运行中'
+                  : status?.installed
+                    ? '内核已停止'
+                    : '尚未安装内核'}
           </span>
           <Button
             size='sm'
@@ -219,14 +244,48 @@ export function MihomoPanel() {
           {status.error}
         </p>
       )}
-      {busy && (
+      {operation.isPending && !progress && (
         <p role='status' className='flex items-center gap-2 text-sm'>
           <Loader2
             className='size-4 animate-spin motion-reduce:animate-none'
             aria-hidden='true'
           />
-          正在处理；操作完成前不会显示成功。
+          正在应用操作…
         </p>
+      )}
+      {progress && (
+        <div
+          className='flex flex-wrap items-center gap-3 text-sm'
+          role='status'
+          aria-live='polite'
+        >
+          <span>
+            已检测 {progress.completed}/{progress.total}；成功{' '}
+            {progress.succeeded}，失败 {progress.failed}
+            {progress.cancelled ? '；其余未检测' : ''}
+          </span>
+          {!!progress.active.length && (
+            <span className='text-muted-foreground'>
+              正在检测：
+              {progress.active
+                .map(
+                  (id) => status?.nodes.find((n) => n.id === id)?.label || id
+                )
+                .join('、')}
+            </span>
+          )}
+          {operation.isPending && (
+            <Button
+              size='sm'
+              variant='outline'
+              onClick={() => {
+                cancelChecks.current = true
+              }}
+            >
+              停止后续检测
+            </Button>
+          )}
+        </div>
       )}
       <div className='grid gap-5 xl:grid-cols-[minmax(0,1fr)_320px]'>
         <div className='space-y-3'>
@@ -255,7 +314,7 @@ export function MihomoPanel() {
             下载模式仅影响订阅获取，不影响账号请求；自动模式的直连回退可能向订阅提供方暴露服务器
             IP。
           </p>
-          {!status?.sources.length && (
+          {status && !status.sources.length && (
             <p className='rounded-md border border-dashed p-5 text-sm text-muted-foreground'>
               安装内核后添加 Clash/Mihomo YAML 订阅，或导入 HTTP(S)/SOCKS5
               动态代理。
@@ -271,6 +330,9 @@ export function MihomoPanel() {
                 <p className='text-xs text-muted-foreground'>
                   {s.kind === 'dynamic' ? '动态代理' : '订阅'} · {s.nodes}{' '}
                   个节点 · {s.enabled ? '已启用' : '已停用'}
+                  <span className='block'>
+                    更新于 {new Date(s.updated_at).toLocaleString()}
+                  </span>
                 </p>
               </div>
               <div className='flex flex-wrap gap-1'>
@@ -333,79 +395,82 @@ export function MihomoPanel() {
             submitSource()
           }}
         >
-          <h3 className='font-medium'>{editing ? '编辑来源' : '添加来源'}</h3>
-          {!editing && (
-            <select
-              aria-label='来源类型'
-              className={`${selectStyle} w-full`}
-              value={kind}
-              onChange={(e) => {
-                setKind(e.target.value)
-                setContent('')
-              }}
-            >
-              <option value='subscription'>Clash/Mihomo 订阅</option>
-              <option value='dynamic'>HTTP(S)/SOCKS5 动态代理</option>
-            </select>
-          )}
-          <label className='block space-y-1 text-sm'>
-            <span>名称</span>
-            <Input
-              value={name}
-              maxLength={80}
-              onChange={(e) => setName(e.target.value)}
-              placeholder='例如：主用订阅'
-            />
-          </label>
-          {(!editing || kind === 'subscription') && (
-            <label className='block space-y-1 text-sm'>
-              <span>
-                {kind === 'subscription' ? '订阅地址' : '代理地址，每行一个'}
-              </span>
-              {kind === 'subscription' ? (
-                <Input
-                  type='password'
-                  autoComplete='off'
-                  value={content}
-                  onChange={(e) => setContent(e.target.value)}
-                  placeholder={editing ? '留空仅修改名称' : 'https://…'}
-                />
-              ) : (
-                <Textarea
-                  autoComplete='off'
-                  value={content}
-                  onChange={(e) => setContent(e.target.value)}
-                  placeholder='socks5://用户:密码@主机:端口#名称'
-                />
-              )}
-            </label>
-          )}
-          <p className='text-xs text-muted-foreground'>
-            地址和凭据不在列表回显；动态代理固定供应商配置，不保证公网 IP 不变。
-          </p>
-          <div className='flex gap-2'>
-            <Button
-              type='submit'
-              disabled={
-                busy || !status?.installed || (!editing && !content.trim())
-              }
-            >
-              {editing ? '保存' : '添加'}
-            </Button>
-            {editing && (
-              <Button
-                type='button'
-                variant='ghost'
-                onClick={() => {
-                  setEditing(null)
-                  setName('')
+          <fieldset disabled={busy} className='space-y-3'>
+            <h3 className='font-medium'>{editing ? '编辑来源' : '添加来源'}</h3>
+            {!editing && (
+              <select
+                aria-label='来源类型'
+                className={`${selectStyle} w-full`}
+                value={kind}
+                onChange={(e) => {
+                  setKind(e.target.value)
                   setContent('')
                 }}
               >
-                取消
-              </Button>
+                <option value='subscription'>Clash/Mihomo 订阅</option>
+                <option value='dynamic'>HTTP(S)/SOCKS5 动态代理</option>
+              </select>
             )}
-          </div>
+            <label className='block space-y-1 text-sm'>
+              <span>名称</span>
+              <Input
+                value={name}
+                maxLength={80}
+                onChange={(e) => setName(e.target.value)}
+                placeholder='例如：主用订阅'
+              />
+            </label>
+            {(!editing || kind === 'subscription') && (
+              <label className='block space-y-1 text-sm'>
+                <span>
+                  {kind === 'subscription' ? '订阅地址' : '代理地址，每行一个'}
+                </span>
+                {kind === 'subscription' ? (
+                  <Input
+                    type='password'
+                    autoComplete='off'
+                    value={content}
+                    onChange={(e) => setContent(e.target.value)}
+                    placeholder={editing ? '留空仅修改名称' : 'https://…'}
+                  />
+                ) : (
+                  <Textarea
+                    autoComplete='off'
+                    value={content}
+                    onChange={(e) => setContent(e.target.value)}
+                    placeholder='socks5://用户:密码@主机:端口#名称'
+                  />
+                )}
+              </label>
+            )}
+            <p className='text-xs text-muted-foreground'>
+              地址和凭据不在列表回显；动态代理固定供应商配置，不保证公网 IP
+              不变。
+            </p>
+            <div className='flex gap-2'>
+              <Button
+                type='submit'
+                disabled={
+                  busy || !status?.installed || (!editing && !content.trim())
+                }
+              >
+                {editing ? '保存' : '添加'}
+              </Button>
+              {editing && (
+                <Button
+                  type='button'
+                  variant='ghost'
+                  onClick={() => {
+                    setEditing(null)
+                    setName('')
+                    setContent('')
+                  }}
+                >
+                  取消
+                </Button>
+              )}
+            </div>
+          </fieldset>
         </form>
       </div>
       <div className='space-y-3 border-t pt-5'>
@@ -578,10 +643,27 @@ export function MihomoPanel() {
                     </p>
                   </td>
                   <td className='p-3 whitespace-nowrap'>
-                    {n.enabled ? '已启用' : '已停用'}
+                    {n.enabled ? '节点已启用' : '节点已停用'}
+                    {n.outlet && (
+                      <p className='text-xs text-muted-foreground'>
+                        {n.outlet.enabled
+                          ? n.outlet.status === 'ok'
+                            ? '出口正常'
+                            : '出口待检测'
+                          : '出口不可用'}{' '}
+                        · {n.outlet.bound_count} 个绑定槽位
+                      </p>
+                    )}
+                    {n.outlet?.error && (
+                      <p className='text-xs text-destructive'>
+                        {n.outlet.error === 'mihomo_unavailable'
+                          ? '内核、来源或出口已停用'
+                          : '出口检测异常，请重新检测'}
+                      </p>
+                    )}
                   </td>
                   <td className='p-3'>
-                    {n.check?.geo?.ip || '未检测'}
+                    {n.check?.geo?.ip || (n.check ? '本次未获取' : '未检测')}
                     <p className='text-xs text-muted-foreground'>
                       {n.check?.geo?.country || ''}
                     </p>
@@ -592,6 +674,11 @@ export function MihomoPanel() {
                         ? `${n.check.latency_ms} ms`
                         : '连接失败'
                       : '未检测'}
+                    {n.check?.checked_at && (
+                      <p className='text-xs text-muted-foreground'>
+                        {new Date(n.check.checked_at).toLocaleString()}
+                      </p>
+                    )}
                     {n.check?.quality && (
                       <p className='text-xs text-muted-foreground'>
                         {n.check.quality.passed}/{n.check.quality.total}{' '}
