@@ -369,3 +369,27 @@ test('subscription errors identify authentication and node index without exposin
     },
   )
 })
+
+test('syncing a probe-disabled outlet preserves its pending slot recovery', async (t) => {
+  let schedulable = true
+  const { manager, pool } = fixture(t, {
+    pool: {
+      onDisableVm: () => {
+        schedulable = false
+      },
+      onEnableVm: () => {
+        schedulable = true
+      },
+    },
+  })
+  const [id] = await exported(manager)
+  pool.bind(managedProxyId(id), 'slot-a')
+  pool.probeOne = async () => ({ ok: false, error: 'timeout', latency_ms: 1 })
+  await pool.probeById(managedProxyId(id))
+  await pool.probeById(managedProxyId(id))
+  assert.equal(schedulable, false)
+  await manager.perform({ action: 'source_rename', id: manager.state.sources[0].id, label: 'renamed' })
+  pool.probeOne = async () => ({ ok: true, latency_ms: 1 })
+  await pool.probeById(managedProxyId(id))
+  assert.equal(schedulable, true)
+})

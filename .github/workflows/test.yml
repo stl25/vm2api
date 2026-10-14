@@ -42,10 +42,10 @@ jobs:
           npm run fetch:payload
           npm run build:egress
       - run: npm run test:unit
-      - name: Mihomo real-kernel isolation and restart regression
+      - name: Mihomo and backup restore regressions
         env:
           KIN_MIHOMO_INSTALL_SMOKE: '1'
-        run: node --test test/e2e/mihomo.e2e.test.mjs
+        run: node --test test/e2e/mihomo.e2e.test.mjs test/e2e/backup.e2e.test.mjs
       - name: ARM64 host preparation and rollback tests
         run: python3 -m unittest discover -s test/deploy -v
 

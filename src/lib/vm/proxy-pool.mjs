@@ -506,7 +506,7 @@ export class ProxyPool extends EventEmitter {
         p.last_error = 'mihomo_unavailable'
         if (newlyUnavailable) this._cascadeDisableVm(p, 'mihomo_unavailable')
       } else if (!wasEnabled) {
-        p.status = 'unknown'
+        p.status = p.last_error ? 'fail' : 'unknown'
         p.consecutive_failures = 0
         // Keep the failure until a successful probe can resume affected slots.
       }
