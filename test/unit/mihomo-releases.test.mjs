@@ -1,6 +1,9 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { Readable } from 'node:stream'
+import http from 'node:http'
+import { once } from 'node:events'
+import nodeFetch from 'node-fetch'
 import { createHash } from 'node:crypto'
 import { resolveMihomoRelease, downloadMihomoRelease } from '../../src/lib/mihomo/releases.mjs'
 
@@ -112,4 +115,106 @@ test('corrupt, truncated, oversized and broken downloads fail before installatio
     ),
   })
   await assert.rejects(downloadMihomoRelease(selected, { fetchImpl: broken }), { code: 'kernel_download_failed' })
+})
+
+async function unfinishedResponse(t, status, content = 'unfinished response') {
+  let socket
+  const server = http.createServer((_request, response) => {
+    response.writeHead(status)
+    response.write(content)
+  })
+  server.on('connection', (connection) => {
+    socket = connection
+  })
+  t.after(async () => {
+    server.closeAllConnections()
+    await new Promise((resolve) => server.close(resolve))
+  })
+  server.listen(0, '127.0.0.1')
+  await once(server, 'listening')
+  return {
+    fetchImpl: (_url, options) => nodeFetch(`http://127.0.0.1:${server.address().port}`, options),
+    async assertClosed() {
+      if (!socket.destroyed) await once(socket, 'close', { signal: AbortSignal.timeout(1000) })
+      assert.equal(socket.destroyed, true)
+    },
+  }
+}
+
+test('release lookup closes an unfinished HTTP error response before returning', async (t) => {
+  const response = await unfinishedResponse(t, 503)
+  await assert.rejects(resolveMihomoRelease('latest', { fetchImpl: response.fetchImpl }), {
+    code: 'kernel_release_failed',
+  })
+  await response.assertClosed()
+})
+
+test('release download closes an unfinished HTTP error response before returning', async (t) => {
+  const selected = await resolveMihomoRelease('latest', { fetchImpl: fetchRelease(release()) })
+  const response = await unfinishedResponse(t, 503)
+  await assert.rejects(downloadMihomoRelease(selected, { fetchImpl: response.fetchImpl }), {
+    code: 'kernel_download_failed',
+  })
+  await response.assertClosed()
+})
+
+test('an oversized streaming download aborts the HTTP connection as well as its body', async (t) => {
+  const selected = await resolveMihomoRelease('latest', { fetchImpl: fetchRelease(release()) })
+  const response = await unfinishedResponse(t, 200, Buffer.alloc(selected.size + 1))
+  await assert.rejects(downloadMihomoRelease(selected, { fetchImpl: response.fetchImpl }), {
+    code: 'kernel_download_failed',
+  })
+  await response.assertClosed()
+})
+
+test('release lookup accepts cancellation and closes a pending response', async (t) => {
+  const response = await unfinishedResponse(t, 200, '{')
+  const abort = new AbortController()
+  await assert.rejects(
+    resolveMihomoRelease('latest', {
+      signal: abort.signal,
+      fetchImpl: async (...args) => {
+        const res = await response.fetchImpl(...args)
+        abort.abort()
+        return res
+      },
+    }),
+    { code: 'kernel_operation_cancelled' },
+  )
+  await response.assertClosed()
+})
+
+test('release download accepts cancellation and closes a pending response', async (t) => {
+  const selected = await resolveMihomoRelease('latest', { fetchImpl: fetchRelease(release()) })
+  const response = await unfinishedResponse(t, 200, 'partial')
+  const abort = new AbortController()
+  await assert.rejects(
+    downloadMihomoRelease(selected, {
+      signal: abort.signal,
+      fetchImpl: async (...args) => {
+        const res = await response.fetchImpl(...args)
+        abort.abort()
+        return res
+      },
+    }),
+    { code: 'kernel_operation_cancelled' },
+  )
+  await response.assertClosed()
+})
+
+test('cancelling after the first download chunk aborts the HTTP connection', { timeout: 5000 }, async (t) => {
+  const selected = await resolveMihomoRelease('latest', { fetchImpl: fetchRelease(release()) })
+  const response = await unfinishedResponse(t, 200, bytes.subarray(0, 4))
+  const abort = new AbortController()
+  await assert.rejects(
+    downloadMihomoRelease(selected, {
+      signal: abort.signal,
+      fetchImpl: response.fetchImpl,
+      onProgress: (progress) => {
+        if (progress.downloaded_bytes > 0) abort.abort()
+      },
+    }),
+    { code: 'kernel_operation_cancelled' },
+  )
+  await response.assertClosed()
 })

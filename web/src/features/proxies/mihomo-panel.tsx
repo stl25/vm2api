@@ -158,6 +158,7 @@ export function MihomoPanel() {
     installingRequest || (!!status?.busy && !!installFeedback?.active)
   const rows = filterMihomoNodes(status?.nodes || [], filters)
   const targets = selectedMihomoNodes(rows, selected)
+  const selectedIds = new Set(selected)
   const countries = [
     ...new Set(
       (status?.nodes || [])
@@ -168,6 +169,12 @@ export function MihomoPanel() {
   const lastPage = Math.max(0, Math.ceil(rows.length / 50) - 1)
   const currentPage = Math.min(page, lastPage)
   const visible = rows.slice(currentPage * 50, currentPage * 50 + 50)
+  const selectedOnPage = visible.filter((node) =>
+    selectedIds.has(node.id)
+  ).length
+  const disabledTargets = rows.filter(
+    (node) => selectedIds.has(node.id) && !node.enabled
+  ).length
   const changeFilter = (key: keyof typeof filters, value: string) => {
     setFilters((f) => ({ ...f, [key]: value }))
     setPage(0)
@@ -689,6 +696,22 @@ export function MihomoPanel() {
           <Button
             size='sm'
             variant='outline'
+            disabled={!rows.length}
+            onClick={() => setSelected(rows.map((node) => node.id))}
+          >
+            选择全部筛选结果（{rows.length}）
+          </Button>
+          <Button
+            size='sm'
+            variant='ghost'
+            disabled={!selected.length}
+            onClick={() => setSelected([])}
+          >
+            清空选择
+          </Button>
+          <Button
+            size='sm'
+            variant='outline'
             disabled={busy || !targets.length}
             onClick={() => operation.mutate({ action: 'test', ids: targets })}
           >
@@ -729,7 +752,9 @@ export function MihomoPanel() {
           </Button>
           <Button
             size='sm'
-            disabled={busy || !targets.length || !status?.running}
+            disabled={
+              busy || !targets.length || !!disabledTargets || !status?.running
+            }
             onClick={() =>
               ask(
                 { action: 'node_export', ids: targets },
@@ -740,6 +765,12 @@ export function MihomoPanel() {
             添加所选到代理池
           </Button>
         </div>
+        {!!disabledTargets && (
+          <p className='text-sm text-muted-foreground'>
+            所选有 {disabledTargets}{' '}
+            个停用节点，加入代理池前请先启用或取消选择。
+          </p>
+        )}
         <p className='text-xs text-muted-foreground'>
           检测使用独立内核，不切换业务出口；质量结果仅代表常见 HTTPS
           站点连通性，不代表模型可用或 IP 风险等级。
@@ -753,9 +784,14 @@ export function MihomoPanel() {
                     type='checkbox'
                     aria-label='选择本页节点'
                     checked={
-                      !!visible.length &&
-                      visible.every((n) => selected.includes(n.id))
+                      !!visible.length && selectedOnPage === visible.length
                     }
+                    ref={(input) => {
+                      if (input)
+                        input.indeterminate =
+                          selectedOnPage > 0 && selectedOnPage < visible.length
+                    }}
+                    disabled={!visible.length}
                     onChange={(e) =>
                       setSelected(
                         e.target.checked
@@ -786,7 +822,7 @@ export function MihomoPanel() {
                     <input
                       type='checkbox'
                       aria-label={`选择 ${n.label}`}
-                      checked={selected.includes(n.id)}
+                      checked={selectedIds.has(n.id)}
                       onChange={(e) =>
                         setSelected(
                           e.target.checked

@@ -24,7 +24,7 @@ const credentials = (port) => ({ port, username: 'vm2api', password: randomBytes
 const label = (value, fallback) =>
   String(value || fallback)
     .trim()
-    .slice(0, 80)
+    .slice(0, 80) || fallback
 
 export class MihomoManager {
   constructor({ dataDir, proxyPool, runtime, fetchImpl = nodeFetch, probeImpl, binary } = {}) {
@@ -70,7 +70,7 @@ export class MihomoManager {
     this.state = this.readState()
     this.checks.clear()
     try {
-      if (this.state.autostart) await this.runtime.start(kernelConfig(this.state))
+      if (this.state.autostart) await this.runtime.start(kernelConfig(this.state), { signal: this.abort.signal })
     } finally {
       this.syncPool()
     }
@@ -145,7 +145,7 @@ export class MihomoManager {
       await this.runtime.detectVersion?.()
       if (!this.state.autostart) return
       await this.exclusive(async () => {
-        await this.runtime.start(kernelConfig(this.state))
+        await this.runtime.start(kernelConfig(this.state), { signal: this.abort.signal })
         this.syncPool()
       })
     } catch (error) {
@@ -185,6 +185,7 @@ export class MihomoManager {
     )
     try {
       await this.runtime.apply(kernelConfig(next), rejected)
+      if (this.closed) throw fault('closed', 'Mihomo 管理器已关闭，未应用新配置', 409)
       atomicJson(this.file, next)
     } catch (error) {
       try {
@@ -223,16 +224,18 @@ export class MihomoManager {
     let failure
     for (const route of routes) {
       const agent = route ? createProxyAgent(route) : null
+      const abort = new AbortController()
+      let response
       try {
-        const response = await this.fetch(url, {
-          signal: AbortSignal.any([this.abort.signal, AbortSignal.timeout(30000)]),
+        response = await this.fetch(url, {
+          signal: AbortSignal.any([this.abort.signal, abort.signal, AbortSignal.timeout(30000)]),
           size: MAX_SOURCE_BYTES,
           redirect: 'follow',
           follow: 5,
           agent: agent || undefined,
           headers: { 'user-agent': 'mihomo/vm2api', accept: 'text/yaml,application/yaml,text/plain' },
         })
-        if (!response.ok)
+        if (!response.ok) {
           throw fault(
             'subscription_http_failed',
             response.status === 401 || response.status === 403
@@ -240,12 +243,15 @@ export class MihomoManager {
               : '订阅服务器返回 HTTP ' + response.status,
             502,
           )
+        }
         return parseSubscription(await response.text())
       } catch (error) {
         failure = error.status
           ? error
           : fault('subscription_download_failed', '订阅下载失败，请检查网络或下载模式', 502)
       } finally {
+        abort.abort()
+        response?.body?.destroy()
         agent?.destroy()
       }
     }
@@ -253,8 +259,13 @@ export class MihomoManager {
   }
 
   async start(next) {
+    if (this.closed) throw fault('closed', 'Mihomo 管理器已关闭', 409)
     next.download ||= await this.reserve(next)
-    await this.runtime.start(kernelConfig(next))
+    await this.runtime.start(kernelConfig(next), { signal: this.abort.signal })
+    if (this.closed) {
+      await this.runtime.stop()
+      throw fault('closed', 'Mihomo 管理器已关闭，未保存自启动配置', 409)
+    }
     next.autostart = true
     try {
       atomicJson(this.file, next)
@@ -276,7 +287,7 @@ export class MihomoManager {
       if (ids.length > 100) throw fault('too_many_targets', '单次最多操作 100 个节点')
       switch (action) {
         case 'check_update':
-          await this.runtime.checkUpdate()
+          await this.runtime.checkUpdate({ signal: this.abort.signal })
           return this.status()
         case 'install': {
           this.installProgress = {
@@ -290,6 +301,7 @@ export class MihomoManager {
             await this.runtime.install({
               version: body.version ?? 'latest',
               config: kernelConfig(next),
+              signal: this.abort.signal,
               onProgress: (progress) => {
                 this.installProgress = progress
               },
@@ -464,7 +476,7 @@ export class MihomoManager {
         const config = kernelConfig({ sources: [], disabled: [], bindings: {} })
         config.proxies = [{ ...node.config, name: id }]
         config.listeners = [socksListener(id, b, id)]
-        await runtime.start(config)
+        await runtime.start(config, { signal: this.abort.signal })
         result = await checkExit(localProxyUrl(b), quality)
       }
       if (collectNodes(this.state).has(id)) this.checks.set(id, { ...result, checked_at: new Date().toISOString() })

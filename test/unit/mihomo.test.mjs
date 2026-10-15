@@ -3,6 +3,9 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import http from 'node:http'
+import { once } from 'node:events'
+import nodeFetch from 'node-fetch'
 import { parseSubscription, parseDynamic, collectNodes, kernelConfig, fault } from '../../src/lib/mihomo/config.mjs'
 import { MihomoManager, managedProxyId, checkExit } from '../../src/lib/mihomo/manager.mjs'
 import { ProxyPool } from '../../src/lib/vm/proxy-pool.mjs'
@@ -304,4 +307,122 @@ test('restore reads the installed version even when autostart is disabled', asyn
   await manager.restore()
   assert.equal(manager.status().version, 'v1.20.3')
   assert.equal(runtime.running, false)
+})
+
+test('blank source names use a visible default and blank renames retain the existing name', async (t) => {
+  const { manager } = fixture(t)
+  await manager.perform({ action: 'source_add', url: 'https://source.example', label: '   ' })
+  const source = manager.status().sources[0]
+  assert.equal(source.label, '订阅 1')
+  await manager.perform({ action: 'source_rename', id: source.id, label: '  主用订阅  ' })
+  await manager.perform({ action: 'source_rename', id: source.id, label: '   ' })
+  assert.equal(manager.status().sources[0].label, '主用订阅')
+  await manager.perform({ action: 'dynamic_add', text: 'http://dynamic.example:8000', label: '   ' })
+  assert.equal(manager.status().sources[1].label, '动态代理')
+})
+
+test('HTTP subscription failures close the response body and preserve the cached source', async (t) => {
+  const { manager } = fixture(t)
+  await add(manager)
+  const before = fs.readFileSync(manager.file, 'utf8')
+  let closed = 0
+  manager.fetch = async () => ({
+    ok: false,
+    status: 403,
+    body: {
+      destroy() {
+        closed++
+      },
+    },
+  })
+  await assert.rejects(manager.perform({ action: 'source_refresh', id: manager.state.sources[0].id }), {
+    code: 'subscription_http_failed',
+  })
+  assert.equal(closed, 1)
+  assert.equal(fs.readFileSync(manager.file, 'utf8'), before)
+  assert.equal(manager.status().nodes.length, 1)
+})
+
+test('closing during an installation aborts the download and never starts or enables autostart', async (t) => {
+  const { manager, runtime } = fixture(t)
+  let signal
+  runtime.install = (options) => {
+    signal = options.signal
+    return new Promise((resolve, reject) =>
+      signal.addEventListener('abort', () => reject(fault('cancelled', '已取消', 409)), { once: true }),
+    )
+  }
+  const installing = manager.perform({ action: 'install' })
+  const rejected = assert.rejects(installing, { code: 'cancelled' })
+  await manager.close()
+  await rejected
+  assert.equal(signal.aborted, true)
+  assert.equal(runtime.configs.length, 0)
+  assert.equal(runtime.running, false)
+  assert.equal(manager.state.autostart, false)
+  assert.equal(fs.existsSync(manager.file), false)
+})
+
+test('closing during startup stops a late-ready kernel without persisting autostart', async (t) => {
+  const { manager, runtime } = fixture(t)
+  const entered = Promise.withResolvers()
+  const release = Promise.withResolvers()
+  runtime.start = async () => {
+    entered.resolve()
+    await release.promise
+    runtime.running = true
+  }
+  const starting = manager.perform({ action: 'start' })
+  await entered.promise
+  const rejected = assert.rejects(starting, { code: 'closed' })
+  const closing = manager.close()
+  release.resolve()
+  await Promise.all([rejected, closing])
+  assert.equal(runtime.running, false)
+  assert.equal(manager.state.autostart, false)
+  assert.equal(fs.existsSync(manager.file), false)
+})
+
+test('closing while applying a source preserves the previous persisted configuration', async (t) => {
+  const { manager, runtime } = fixture(t)
+  await add(manager)
+  const before = fs.readFileSync(manager.file, 'utf8')
+  const entered = Promise.withResolvers()
+  const release = Promise.withResolvers()
+  let calls = 0
+  runtime.apply = async () => {
+    if (++calls === 1) {
+      entered.resolve()
+      await release.promise
+    }
+  }
+  const changing = manager.perform({ action: 'source_rename', id: manager.state.sources[0].id, label: 'changed' })
+  await entered.promise
+  const rejected = assert.rejects(changing, { code: 'closed' })
+  const closing = manager.close()
+  release.resolve()
+  await Promise.all([rejected, closing])
+  assert.equal(fs.readFileSync(manager.file, 'utf8'), before)
+  assert.notEqual(manager.status().sources[0].label, 'changed')
+})
+
+test('subscription HTTP errors abort an unfinished real HTTP socket', async (t) => {
+  let socket
+  const server = http.createServer((_req, res) => {
+    res.writeHead(403)
+    res.write('unfinished authentication error')
+  })
+  server.on('connection', (connection) => {
+    socket = connection
+  })
+  t.after(async () => {
+    server.closeAllConnections()
+    await new Promise((resolve) => server.close(resolve))
+  })
+  server.listen(0, '127.0.0.1')
+  await once(server, 'listening')
+  const { manager } = fixture(t, { fetchImpl: nodeFetch })
+  await assert.rejects(add(manager, `http://127.0.0.1:${server.address().port}`), { code: 'subscription_http_failed' })
+  if (!socket.destroyed) await once(socket, 'close', { signal: AbortSignal.timeout(1000) })
+  assert.equal(socket.destroyed, true)
 })
